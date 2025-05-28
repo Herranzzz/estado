@@ -1,8 +1,9 @@
 name: Actualizar estados Shopify CTT
 
 on:
+  workflow_dispatch:     # ✅ Habilita el botón manual
   schedule:
-    - cron: "0 * * * *"  # Cada hora, minuto 0 (hora UTC)
+    - cron: "0 * * * *"  # ⏰ Ejecuta cada hora (opcional)
 
 jobs:
   run-script:
