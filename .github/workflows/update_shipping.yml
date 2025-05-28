@@ -1,26 +1,27 @@
 name: Actualizar estados Shopify CTT
 
 on:
-  workflow_dispatch:     # ✅ Habilita el botón manual
   schedule:
-    - cron: "0 * * * *"  # ⏰ Ejecuta cada hora (opcional)
+    - cron: "*/5 * * * *"  # Ejecuta cada 5 minutos
+  workflow_dispatch:       # Permite ejecución manual
 
 jobs:
-  run-script:
+  update-shipping-status:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+      - name: Clonar repositorio
+        uses: actions/checkout@v3
 
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.11"
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
 
-    - name: Install requests
-      run: pip install requests
+      - name: Instalar dependencias
+        run: pip install requests
 
-    - name: Run update_shipping.py
-      env:
-        ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-      run: python update_shipping.py
+      - name: Ejecutar script
+        env:
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+        run: python update_shipping.py
