@@ -1,3 +1,9 @@
+import os
+
+ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+
+# El resto del código igual
+
 import requests
 
 # Datos Shopify
