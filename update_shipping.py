@@ -2,8 +2,7 @@ import requests
 import os
 import time
 
-# Configura tu dominio y token de Shopify
-SHOP = "48d471-2"  # cambia si usas otro dominio
+SHOP = "48d471-2"
 ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
 
 HEADERS = {
@@ -13,7 +12,6 @@ HEADERS = {
 
 
 def get_fulfilled_orders():
-    """Obtiene pedidos que ya están completamente entregados"""
     url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders.json"
     params = {
         "fulfillment_status": "fulfilled",
@@ -26,8 +24,20 @@ def get_fulfilled_orders():
     return response.json()["orders"]
 
 
+def already_has_delivered_event(order_id, fulfillment_id):
+    """Comprueba si ya hay un evento 'delivered' en el fulfillment"""
+    url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    response = requests.get(url, headers=HEADERS)
+    
+    if response.status_code != 200:
+        print(f"⚠ Error al verificar eventos para fulfillment {fulfillment_id}")
+        return False
+
+    events = response.json().get("events", [])
+    return any(event.get("status") == "delivered" for event in events)
+
+
 def create_delivery_event(order_id, fulfillment_id):
-    """Crea el evento de entrega en Shopify y notifica al cliente"""
     url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     data = {
         "event": {
@@ -38,9 +48,9 @@ def create_delivery_event(order_id, fulfillment_id):
 
     response = requests.post(url, headers=HEADERS, json=data)
     if response.status_code == 201:
-        print(f"✔ Entrega registrada y correo enviado para fulfillment {fulfillment_id}")
+        print(f"✅ Evento 'delivered' creado para fulfillment {fulfillment_id}")
     else:
-        print(f"❌ Error al registrar entrega: {response.status_code} - {response.text}")
+        print(f"❌ Error creando evento: {response.status_code} - {response.text}")
 
 
 def main():
@@ -53,17 +63,11 @@ def main():
 
         for fulfillment in fulfillments:
             fulfillment_id = fulfillment["id"]
-            # Evita duplicados: no crees eventos si ya existe el de "delivered"
-            events_url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-            events_resp = requests.get(events_url, headers=HEADERS)
-            events = events_resp.json().get("events", [])
-
-            already_delivered = any(e["status"] == "delivered" for e in events)
-            if not already_delivered:
+            if not already_has_delivered_event(order_id, fulfillment_id):
                 create_delivery_event(order_id, fulfillment_id)
-                time.sleep(1)  # para evitar el rate limit
+                time.sleep(1)
             else:
-                print(f"⚠ Ya existe evento 'delivered' para fulfillment {fulfillment_id}")
+                print(f"⏭ Ya tiene evento 'delivered': {fulfillment_id}")
 
 
 if __name__ == "__main__":
