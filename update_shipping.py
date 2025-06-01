@@ -1,74 +1,114 @@
-import requests
 import os
+import requests
 import time
 
-SHOP = "48d471-2"
-ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+# Shopify
+SHOP_URL = "https://48d471-2.myshopify.com"
+ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-Shopify-Access-Token": ACCESS_TOKEN
-}
+# CTT
+CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
 
-
-def get_fulfilled_orders():
-    url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders.json"
-    params = {
-        "fulfillment_status": "fulfilled",
-        "status": "any",
-        "limit": 50
+def get_fulfilled_orders(limit=300):
+    all_orders = []
+    page_info = None
+    base_url = f"{SHOP_URL}/admin/api/2023-10/orders.json?fulfillment_status=fulfilled&status=any&limit=50"
+    headers = {
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json"
     }
 
-    response = requests.get(url, headers=HEADERS, params=params)
-    response.raise_for_status()
-    return response.json()["orders"]
+    while len(all_orders) < limit:
+        url = base_url
+        if page_info:
+            url += f"&page_info={page_info}"
+        r = requests.get(url, headers=headers)
+        r.raise_for_status()
+        orders = r.json()["orders"]
+        if not orders:
+            break
+        all_orders.extend(orders)
+        link = r.headers.get("Link", "")
+        if 'rel="next"' in link:
+            page_info = link.split("page_info=")[-1].split(">")[0]
+        else:
+            break
+    return all_orders[:limit]
 
+def get_ctt_status(tracking_number):
+    r = requests.get(CTT_API_URL + tracking_number)
+    if r.status_code != 200:
+        return "CTT API error"
+    data = r.json()
+    if data.get("error") is not None:
+        return "Error en API CTT"
+    events = data.get("data", {}).get("shipping_history", {}).get("events", [])
+    if not events:
+        return "Sin eventos"
+    return events[-1].get("description", "Estado desconocido")
 
-def already_has_delivered_event(order_id, fulfillment_id):
-    """Comprueba si ya hay un evento 'delivered' en el fulfillment"""
-    url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-    response = requests.get(url, headers=HEADERS)
-    
-    if response.status_code != 200:
-        print(f"⚠ Error al verificar eventos para fulfillment {fulfillment_id}")
+def is_already_delivered(order_id, fulfillment_id):
+    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    headers = {
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
         return False
+    events = r.json().get("fulfillment_events", [])
+    for event in events:
+        if event.get("status") == "delivered":
+            return True
+    return False
 
-    events = response.json().get("events", [])
-    return any(event.get("status") == "delivered" for event in events)
+def create_fulfillment_event(order_id, fulfillment_id, status):
+    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    headers = {
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
 
+    status_map = {
+        "En reparto": "out_for_delivery",
+        "Entregado": "delivered",
+        "En tránsito": "in_transit",
+        "Recogido": "in_transit",
+        "Grabado": "confirmed",
+        "Reparto fallido": "exception",
+        "Entrega hoy": "out_for_delivery"
+    }
 
-def create_delivery_event(order_id, fulfillment_id):
-    url = f"https://{SHOP}.myshopify.com/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    event_status = status_map.get(status, "in_transit")
     data = {
         "event": {
-            "status": "delivered",
-            "notify_customer": True
+            "status": event_status,
+            "message": f"Estado CTT: {status}",
+            "notify_customer": event_status == "delivered"
         }
     }
 
-    response = requests.post(url, headers=HEADERS, json=data)
-    if response.status_code == 201:
-        print(f"✅ Evento 'delivered' creado para fulfillment {fulfillment_id}")
+    r = requests.post(url, headers=headers, json=data)
+    if r.status_code == 201:
+        print(f"✅ Pedido {order_id}: '{event_status}' añadido.")
     else:
-        print(f"❌ Error creando evento: {response.status_code} - {response.text}")
+        print(f"❌ Pedido {order_id}: Error {r.status_code} - {r.text}")
 
+# Main
+orders = get_fulfilled_orders()
+for order in orders:
+    fulfillments = order.get("fulfillments", [])
+    if not fulfillments:
+        continue
 
-def main():
-    print("🔄 Buscando pedidos entregados...")
-    orders = get_fulfilled_orders()
+    fulfillment = fulfillments[0]
+    tracking_number = fulfillment.get("tracking_number")
+    if not tracking_number:
+        continue
 
-    for order in orders:
-        order_id = order["id"]
-        fulfillments = order.get("fulfillments", [])
+    if is_already_delivered(order["id"], fulfillment["id"]):
+        continue
 
-        for fulfillment in fulfillments:
-            fulfillment_id = fulfillment["id"]
-            if not already_has_delivered_event(order_id, fulfillment_id):
-                create_delivery_event(order_id, fulfillment_id)
-                time.sleep(1)
-            else:
-                print(f"⏭ Ya tiene evento 'delivered': {fulfillment_id}")
-
-
-if __name__ == "__main__":
-    main()
+    status = get_ctt_status(tracking_number)
+    create_fulfillment_event(order["id"], fulfillment["id"], status)
+    time.sleep(1)  # Evita saturar APIs
