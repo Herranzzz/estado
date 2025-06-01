@@ -21,7 +21,7 @@ def get_fulfilled_orders(limit=300):
     while len(all_orders) < limit:
         url = base_url
         if page_info:
-            url += f"&page_info={page_info}"
+            url = f"{SHOP_URL}/admin/api/2023-10/orders.json?limit=50&page_info={page_info}"
         r = requests.get(url, headers=headers)
         r.raise_for_status()
         orders = r.json()["orders"]
@@ -30,7 +30,10 @@ def get_fulfilled_orders(limit=300):
         all_orders.extend(orders)
         link = r.headers.get("Link", "")
         if 'rel="next"' in link:
-            page_info = link.split("page_info=")[-1].split(">")[0]
+            try:
+                page_info = link.split('page_info=')[1].split('>')[0].split('&')[0]
+            except IndexError:
+                break
         else:
             break
     return all_orders[:limit]
