@@ -66,7 +66,7 @@ def create_fulfillment_event(order_id, fulfillment_id, status):
         "En tránsito": "in_transit",
         "Recogido": "in_transit",
         "Grabado": "confirmed",
-        "Reparto fallido": "exception"
+        "Reparto fallido": "failure"
     }
 
     event_status = status_map.get(status, "in_transit")
