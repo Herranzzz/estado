@@ -87,37 +87,28 @@ def create_fulfillment_event(order_id, fulfillment_id, status):
     else:
         print(f"❌ Error al añadir evento: {r.status_code} - {r.text}")
 
-# Verificar si ya fue entregado (consultando los eventos del fulfillment)
-def ya_entregado(order_id, fulfillment_id):
-    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json"
-    }
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        print(f"⚠️ No se pudieron obtener eventos para el fulfillment {fulfillment_id}")
-        return False
-
-    events = r.json().get("fulfillment_events", [])
-    for e in events:
-        if e.get("status") == "delivered":
-            print(f"🔁 Pedido {order_id} ya marcado como entregado. Saltando.")
-            return True
+# Verificar si ya fue entregado para no duplicar
+def ya_entregado(order):
+    fulfillments = order.get("fulfillments", [])
+    for f in fulfillments:
+        events = f.get("tracking_events", [])
+        for e in events:
+            if e.get("status") == "delivered":
+                return True
     return False
 
 # Main
 def main():
     orders = get_fulfilled_orders()
     for order in orders:
+        if ya_entregado(order):
+            continue
+
         fulfillments = order.get("fulfillments", [])
         if not fulfillments:
             continue
 
         fulfillment = fulfillments[0]
-        if ya_entregado(order["id"], fulfillment["id"]):
-            continue
-
         tracking_number = fulfillment.get("tracking_number")
         if not tracking_number:
             continue
