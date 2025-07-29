@@ -57,8 +57,8 @@ def get_ctt_status(tracking_number):
     last_event = events[-1]
     return last_event.get("description", "Estado desconocido")
 
-# Crear evento en Shopify
-def create_fulfillment_event(order_id, fulfillment_id, status):
+# Mapear estado CTT a estado Shopify
+def map_ctt_to_shopify(status):
     status_map = {
         "En reparto": "out_for_delivery",
         "Entrega hoy": "out_for_delivery",
@@ -68,8 +68,23 @@ def create_fulfillment_event(order_id, fulfillment_id, status):
         "Grabado": "confirmed",
         "Reparto fallido": "failure"
     }
+    return status_map.get(status, "in_transit")
 
-    event_status = status_map.get(status, "in_transit")
+# Obtener último estado del fulfillment en Shopify
+def get_last_fulfillment_status(order):
+    fulfillments = order.get("fulfillments", [])
+    if not fulfillments:
+        return None
+
+    events = fulfillments[0].get("tracking_events", [])
+    if not events:
+        return None
+
+    return events[-1].get("status")
+
+# Crear evento si ha cambiado el estado
+def create_fulfillment_event(order_id, fulfillment_id, status):
+    event_status = map_ctt_to_shopify(status)
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -113,8 +128,15 @@ def main():
         if not tracking_number:
             continue
 
-        status = get_ctt_status(tracking_number)
-        create_fulfillment_event(order["id"], fulfillment["id"], status)
+        ctt_status = get_ctt_status(tracking_number)
+        mapped_ctt_status = map_ctt_to_shopify(ctt_status)
+
+        last_status = get_last_fulfillment_status(order)
+        if last_status == mapped_ctt_status:
+            print(f"ℹ️ Estado no ha cambiado para el pedido {order['id']} ({mapped_ctt_status})")
+            continue
+
+        create_fulfillment_event(order["id"], fulfillment["id"], ctt_status)
 
 if __name__ == "__main__":
     main()
