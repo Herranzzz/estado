@@ -56,21 +56,24 @@ def get_fulfilled_orders(limit=300):
 
 
 def get_ctt_status(tracking_number):
-    """Consulta el estado actual desde la API de CTT."""
+    """Consulta el estado actual desde la API de CTT y devuelve estado + fecha real."""
     r = requests.get(CTT_API_URL + tracking_number)
     if r.status_code != 200:
-        return "CTT API error"
-    
+        return {"status": "CTT API error", "date": None}
+
     data = r.json()
     if data.get("error") is not None:
-        return "Error en API CTT"
+        return {"status": "Error en API CTT", "date": None}
 
     events = data.get("data", {}).get("shipping_history", {}).get("events", [])
     if not events:
-        return "Sin eventos"
+        return {"status": "Sin eventos", "date": None}
 
     last_event = events[-1]
-    return last_event.get("description", "Estado desconocido")
+    return {
+        "status": last_event.get("description", "Estado desconocido"),
+        "date": last_event.get("event_date")  # Fecha real del evento
+    }
 
 
 def map_ctt_to_shopify(status):
@@ -106,8 +109,8 @@ def get_last_fulfillment_event_status(order_id, fulfillment_id):
     return events[-1].get("status")
 
 
-def create_fulfillment_event(order_id, fulfillment_id, status):
-    """Crea un nuevo evento en Shopify con el estado de CTT."""
+def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
+    """Crea un nuevo evento en Shopify con el estado de CTT y fecha real."""
     event_status = map_ctt_to_shopify(status)
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
@@ -120,6 +123,9 @@ def create_fulfillment_event(order_id, fulfillment_id, status):
             "message": f"Estado CTT: {status}"
         }
     }
+    if event_date:
+        payload["event"]["created_at"] = event_date  # Fecha real del evento
+
     r = requests.post(url, headers=headers, json=payload)
     if r.status_code == 201:
         log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {status})")
@@ -145,8 +151,11 @@ def main():
             log(f"⚠️ Pedido {order_id} sin número de seguimiento")
             continue
 
-        # Estado actual en CTT
-        ctt_status = get_ctt_status(tracking_number)
+        # Estado actual y fecha en CTT
+        ctt_result = get_ctt_status(tracking_number)
+        ctt_status = ctt_result["status"]
+        ctt_date = ctt_result["date"]
+
         if "error" in ctt_status.lower():
             log(f"⚠️ Error con CTT para {order_id}: {ctt_status}")
             continue
@@ -156,13 +165,8 @@ def main():
         # Estado actual en Shopify
         last_status = get_last_fulfillment_event_status(order_id, fulfillment_id)
 
-        # 🔒 BLOQUEO: si Shopify ya tiene delivered, no actualizar
-        if last_status == "delivered":
-            log(f"🔒 Pedido {order_id} ya está entregado en Shopify, no se actualiza")
-            continue
-
-        # 🔒 BLOQUEO: si CTT indica entregado y Shopify ya lo tiene así
-        if mapped_ctt_status == "delivered" and last_status == "delivered":
+        # 🔒 No actualizar si ya está entregado
+        if last_status == "delivered" and mapped_ctt_status == "delivered":
             log(f"🔒 Pedido {order_id} ya marcado como entregado, no se actualiza")
             continue
 
@@ -171,8 +175,8 @@ def main():
             log(f"ℹ️ Estado sin cambios para pedido {order_id} ({mapped_ctt_status})")
             continue
 
-        # Actualizar en Shopify
-        create_fulfillment_event(order_id, fulfillment_id, ctt_status)
+        # Actualizar en Shopify con la fecha real
+        create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date)
 
 
 if __name__ == "__main__":
