@@ -45,7 +45,6 @@ def get_fulfilled_orders(limit=300):
             break
         all_orders.extend(orders)
 
-        # Avanza a la siguiente página si existe
         if "Link" in r.headers and 'rel="next"' in r.headers["Link"]:
             url = r.links["next"]["url"]
             params = None
@@ -72,7 +71,7 @@ def get_ctt_status(tracking_number):
     last_event = events[-1]
     return {
         "status": last_event.get("description", "Estado desconocido"),
-        "date": last_event.get("event_date")  # Fecha real del evento
+        "date": last_event.get("event_date")
     }
 
 
@@ -91,7 +90,7 @@ def map_ctt_to_shopify(status):
 
 
 def get_last_fulfillment_event_status(order_id, fulfillment_id):
-    """Obtiene el último estado registrado en Shopify para un fulfillment."""
+    """Obtiene el último estado registrado en Shopify para un fulfillment y lo mapea."""
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -106,11 +105,12 @@ def get_last_fulfillment_event_status(order_id, fulfillment_id):
     if not events:
         return None
 
-    return events[-1].get("status")
+    last_status_raw = events[-1].get("status")
+    return map_ctt_to_shopify(last_status_raw)
 
 
-def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
-    """Crea un nuevo evento en Shopify con el estado de CTT y fecha real."""
+def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None, notify_customer=False):
+    """Crea un nuevo evento en Shopify con el estado de CTT y fecha real, opcionalmente notificando al cliente."""
     event_status = map_ctt_to_shopify(status)
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
@@ -120,15 +120,18 @@ def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
     payload = {
         "event": {
             "status": event_status,
-            "message": f"Estado CTT: {status}"
+            "message": f"Estado CTT: {status}",
+            "notify_customer": notify_customer
         }
     }
     if event_date:
-        payload["event"]["created_at"] = event_date  # Fecha real del evento
+        payload["event"]["created_at"] = event_date
 
     r = requests.post(url, headers=headers, json=payload)
     if r.status_code == 201:
         log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {status})")
+        if notify_customer:
+            log(f"📧 Notificación enviada a cliente por pedido {order_id}")
     else:
         log(f"❌ Error al añadir evento en pedido {order_id}: {r.status_code} - {r.text}")
 
@@ -162,11 +165,11 @@ def main():
 
         mapped_ctt_status = map_ctt_to_shopify(ctt_status)
 
-        # Estado actual en Shopify
+        # Estado actual en Shopify ya mapeado
         last_status = get_last_fulfillment_event_status(order_id, fulfillment_id)
 
         # 🔒 No actualizar si ya está entregado
-        if last_status == "delivered" and mapped_ctt_status == "delivered":
+        if last_status == "delivered":
             log(f"🔒 Pedido {order_id} ya marcado como entregado, no se actualiza")
             continue
 
@@ -175,8 +178,12 @@ def main():
             log(f"ℹ️ Estado sin cambios para pedido {order_id} ({mapped_ctt_status})")
             continue
 
-        # Actualizar en Shopify con la fecha real
-        create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date)
+        # Actualizar en Shopify sin notificar
+        create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date, notify_customer=False)
+
+        # Enviar notificación solo si el estado es "recogido" (mapeado como in_transit)
+        if mapped_ctt_status == "in_transit":
+            create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date, notify_customer=True)
 
 
 if __name__ == "__main__":
