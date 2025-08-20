@@ -1,4 +1,3 @@
-Quiero que este codigo no actualícenles pedidos que ya estan entregados o delivered, :
 import os
 import requests
 from datetime import datetime
