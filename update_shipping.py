@@ -90,8 +90,8 @@ def get_last_fulfillment_event_status(order_id, fulfillment_id):
         events = r.json().get("events", [])
         if not events:
             return None
-        last_status_raw = events[-1].get("status")
-        return map_ctt_to_shopify(last_status_raw)
+        # Shopify ya devuelve 'in_transit', 'delivered', 'out_for_delivery', etc.
+        return events[-1].get("status")
     except Exception as e:
         log(f"❌ Error al obtener eventos de Shopify {order_id}: {e}")
         return None
