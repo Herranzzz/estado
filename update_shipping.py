@@ -4,7 +4,7 @@ from datetime import datetime
 
 # Shopify API
 SHOP_URL = "https://48d471-2.myshopify.com"
-ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") or "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"
+ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") 
 
 # CTT API
 CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
