@@ -1,5 +1,3 @@
-No esta funcionándoosndo, ten en cuenta que este codigo si actualizaba las estados, pero actualizaba a entregado cada vez que se ejecuatab
-
 import os
 import requests
 from datetime import datetime
