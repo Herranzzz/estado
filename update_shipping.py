@@ -176,20 +176,21 @@ def get_ctt_status(tracking_number):
 
     return {"code": code, "text": text, "event_date": event_date, "raw_event": last_event, "no_events": False}
 
+
 def map_ctt_to_shopify(code, text):
     """
     Mapea preferentemente por código; si no, heurísticas sobre texto.
-    Devuelve uno de: in_transit, out_for_delivery, delivered, failure, confirmed
+    Devuelve uno de: in_transit, out_for_delivery, delivered, failure, confirmed, ready_for_pickup
     """
     # mapping de códigos (ejemplo común)
     if code:
         code_s = str(code).strip()
         code_map = {
-            "10": "in_transit",   # admitido / recibido
-            "20": "in_transit",   # en tránsito
+            "10": "in_transit",       # admitido / recibido
+            "20": "in_transit",       # en tránsito
             "30": "out_for_delivery", # en reparto
-            "40": "delivered",    # entregado
-            "50": "failure",      # incidencia / devuelto
+            "40": "delivered",        # entregado
+            "50": "failure",          # incidencia / devuelto
         }
         if code_s in code_map:
             return code_map[code_s]
@@ -201,12 +202,15 @@ def map_ctt_to_shopify(code, text):
             return "delivered"
         if re.search(r"\b(entrega hoy|en reparto|en reparto\b|reparto|repartiendo)\b", s):
             return "out_for_delivery"
+        if re.search(r"disponible para recoger|punto de recogida|listo para retirar", s):
+            return "ready_for_pickup"
         if re.search(r"transit|tr[nó]nsit|en tr[ií]nsito|en tránsito|en camino|en ruta", s):
             return "in_transit"
         if re.search(r"fall|incid|devuel|devolu|devuelto|anul|cancel|no entreg", s):
             return "failure"
         if re.search(r"grabad|grabaci|impr", s):  # grabado / impreso
             return "confirmed"
+
     # fallback conservador
     return "in_transit"
 
