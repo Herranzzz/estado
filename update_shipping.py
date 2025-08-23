@@ -1,6 +1,7 @@
 import os
 import requests
 from datetime import datetime
+from dateutil.parser import parse
 
 # Shopify API
 SHOP_URL = "https://48d471-2.myshopify.com"
@@ -12,13 +13,11 @@ CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
 # Archivo de log
 LOG_FILE = "logs_actualizacion_envios.txt"
 
-
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message}\n")
     print(message)
-
 
 def get_fulfilled_orders(limit=300):
     """Obtiene hasta 'limit' pedidos con fulfillment completado."""
@@ -54,7 +53,6 @@ def get_fulfilled_orders(limit=300):
 
     return all_orders[:limit]
 
-
 def get_ctt_status(tracking_number):
     """Consulta el estado actual desde la API de CTT y devuelve estado + fecha real."""
     r = requests.get(CTT_API_URL + tracking_number)
@@ -75,7 +73,6 @@ def get_ctt_status(tracking_number):
         "date": last_event.get("event_date")  # Fecha real del evento
     }
 
-
 def map_ctt_to_shopify(status):
     """Mapea el estado devuelto por CTT al formato de Shopify."""
     status_map = {
@@ -89,9 +86,8 @@ def map_ctt_to_shopify(status):
     }
     return status_map.get(status, "in_transit")
 
-
-def get_last_fulfillment_event_status(order_id, fulfillment_id):
-    """Obtiene el último estado registrado en Shopify para un fulfillment."""
+def get_last_fulfillment_event(order_id, fulfillment_id):
+    """Obtiene el último evento registrado en Shopify con fecha y estado."""
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -100,18 +96,33 @@ def get_last_fulfillment_event_status(order_id, fulfillment_id):
     r = requests.get(url, headers=headers)
     if r.status_code != 200:
         log(f"❌ No se pudo obtener eventos para {order_id}: {r.status_code}")
-        return None
+        return None, None
 
     events = r.json().get("events", [])
     if not events:
-        return None
+        return None, None
 
-    return events[-1].get("status")
-
+    last_event = events[-1]
+    last_status = last_event.get("status")
+    last_date = parse(last_event.get("created_at"))
+    return last_status, last_date
 
 def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
-    """Crea un nuevo evento en Shopify con el estado de CTT y fecha real."""
+    """Crea un nuevo evento en Shopify con la fecha real si procede."""
     event_status = map_ctt_to_shopify(status)
+    
+    last_status, last_date = get_last_fulfillment_event(order_id, fulfillment_id)
+    
+    if last_status == event_status:
+        if event_date:
+            ctt_event_date = parse(event_date)
+            if last_date.date() >= ctt_event_date.date():
+                log(f"🔒 Pedido {order_id} ya tiene estado '{event_status}' actualizado para esa fecha, no se crea evento")
+                return
+        else:
+            log(f"ℹ️ Estado sin cambios para pedido {order_id} ({event_status})")
+            return
+
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -124,14 +135,13 @@ def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
         }
     }
     if event_date:
-        payload["event"]["created_at"] = event_date  # Fecha real del evento
+        payload["event"]["created_at"] = parse(event_date).isoformat()
 
     r = requests.post(url, headers=headers, json=payload)
     if r.status_code == 201:
         log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {status})")
     else:
         log(f"❌ Error al añadir evento en pedido {order_id}: {r.status_code} - {r.text}")
-
 
 def main():
     orders = get_fulfilled_orders()
@@ -160,24 +170,8 @@ def main():
             log(f"⚠️ Error con CTT para {order_id}: {ctt_status}")
             continue
 
-        mapped_ctt_status = map_ctt_to_shopify(ctt_status)
-
-        # Estado actual en Shopify
-        last_status = get_last_fulfillment_event_status(order_id, fulfillment_id)
-
-        # 🔒 No actualizar si ya está entregado
-        if last_status == "delivered" and mapped_ctt_status == "delivered":
-            log(f"🔒 Pedido {order_id} ya marcado como entregado, no se actualiza")
-            continue
-
-        # Evitar actualizar si no hay cambios
-        if last_status == mapped_ctt_status:
-            log(f"ℹ️ Estado sin cambios para pedido {order_id} ({mapped_ctt_status})")
-            continue
-
-        # Actualizar en Shopify con la fecha real
+        # Crear o actualizar evento solo si hay cambio
         create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date)
-
 
 if __name__ == "__main__":
     main()
