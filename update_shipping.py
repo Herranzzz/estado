@@ -1,5 +1,7 @@
 import os
 import requests
+import typing as t
+import datetime as dt
 from datetime import datetime
 from dateutil.parser import parse
 from zoneinfo import ZoneInfo
@@ -15,7 +17,7 @@ ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
 
 # Zona horaria para la comparación de "hoy"
-# Si prefieres usar tu hora local en MX: os.environ["LOCAL_TZ"] = "America/Mexico_City"
+# Si prefieres MX: export LOCAL_TZ=America/Mexico_City en el job de GitHub Actions
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
 
 # Archivo de log
@@ -33,7 +35,7 @@ def log(message: str):
     print(message)
 
 
-def to_local_date(date_str: str, tz_name: str) -> datetime.date | None:
+def to_local_date(date_str: str, tz_name: str) -> t.Optional[dt.date]:
     """
     Convierte una fecha/hora ISO de CTT a fecha (YYYY-MM-DD) en la zona horaria indicada.
     Devuelve None si no se puede parsear.
@@ -41,18 +43,18 @@ def to_local_date(date_str: str, tz_name: str) -> datetime.date | None:
     if not date_str:
         return None
     try:
-        dt = parse(date_str)
-        # Si no trae tz, asumimos UTC (muchas APIs lo usan). Ajusta si sabes la tz exacta.
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        local_dt = dt.astimezone(ZoneInfo(tz_name))
+        parsed = parse(date_str)
+        # Si no trae tz, asumimos UTC (ajusta si conoces la tz exacta de CTT)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        local_dt = parsed.astimezone(ZoneInfo(tz_name))
         return local_dt.date()
     except Exception as e:
         log(f"⚠️ No se pudo parsear fecha CTT '{date_str}': {e}")
         return None
 
 
-def today_local(tz_name: str) -> datetime.date:
+def today_local(tz_name: str) -> dt.date:
     return datetime.now(ZoneInfo(tz_name)).date()
 
 
@@ -138,7 +140,6 @@ def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
     # 2) Evitar duplicados o retrocesos
     last_status, last_date = get_last_fulfillment_event(order_id, fulfillment_id)
     if last_status == event_status:
-        # Si ya está el mismo estado, comprobamos que no sea para la misma/fecha posterior
         if last_date:
             last_local_date = to_local_date(last_date.isoformat(), LOCAL_TZ)
             if last_local_date and last_local_date >= ctt_event_date:
@@ -161,7 +162,6 @@ def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
         }
     }
     if event_date:
-        # Guardamos created_at para que refleje la hora real del evento CTT
         payload["event"]["created_at"] = parse(event_date).isoformat()
 
     r = requests.post(url, headers=headers, json=payload)
@@ -233,7 +233,6 @@ def main():
         if not fulfillments:
             continue
 
-        # Si hay múltiples fulfillments, puedes recorrerlos. Aquí tomamos el primero.
         fulfillment = fulfillments[0]
         order_id = order["id"]
         fulfillment_id = fulfillment["id"]
@@ -245,7 +244,7 @@ def main():
 
         # Estado actual y fecha en CTT
         ctt_result = get_ctt_status(tracking_number)
-        ctt_status = ctt_result["status"] or ""
+        ctt_status = (ctt_result["status"] or "").strip()
         ctt_date = ctt_result["date"]
 
         if "error" in ctt_status.lower():
