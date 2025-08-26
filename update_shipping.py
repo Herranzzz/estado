@@ -2,28 +2,68 @@ import os
 import requests
 from datetime import datetime
 from dateutil.parser import parse
+from zoneinfo import ZoneInfo
 
+# =========================
+# CONFIG
+# =========================
 # Shopify API
 SHOP_URL = "https://48d471-2.myshopify.com"
-ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") 
+ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
 # CTT API
 CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
 
+# Zona horaria para la comparación de "hoy"
+# Si prefieres usar tu hora local en MX: os.environ["LOCAL_TZ"] = "America/Mexico_City"
+LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
+
 # Archivo de log
 LOG_FILE = "logs_actualizacion_envios.txt"
 
-def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================
+# UTILIDAD
+# =========================
+def log(message: str):
+    tz = ZoneInfo(LOCAL_TZ)
+    timestamp = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message}\n")
     print(message)
 
+
+def to_local_date(date_str: str, tz_name: str) -> datetime.date | None:
+    """
+    Convierte una fecha/hora ISO de CTT a fecha (YYYY-MM-DD) en la zona horaria indicada.
+    Devuelve None si no se puede parsear.
+    """
+    if not date_str:
+        return None
+    try:
+        dt = parse(date_str)
+        # Si no trae tz, asumimos UTC (muchas APIs lo usan). Ajusta si sabes la tz exacta.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        local_dt = dt.astimezone(ZoneInfo(tz_name))
+        return local_dt.date()
+    except Exception as e:
+        log(f"⚠️ No se pudo parsear fecha CTT '{date_str}': {e}")
+        return None
+
+
+def today_local(tz_name: str) -> datetime.date:
+    return datetime.now(ZoneInfo(tz_name)).date()
+
+
+# =========================
+# SHOPIFY
+# =========================
 def get_fulfilled_orders(limit=300):
     """Obtiene hasta 'limit' pedidos con fulfillment completado."""
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     all_orders = []
@@ -32,7 +72,7 @@ def get_fulfilled_orders(limit=300):
         "fulfillment_status": "fulfilled",
         "status": "any",
         "limit": 50,
-        "order": "created_at desc"
+        "order": "created_at desc",
     }
 
     while len(all_orders) < limit:
@@ -53,45 +93,13 @@ def get_fulfilled_orders(limit=300):
 
     return all_orders[:limit]
 
-def get_ctt_status(tracking_number):
-    """Consulta el estado actual desde la API de CTT y devuelve estado + fecha real."""
-    r = requests.get(CTT_API_URL + tracking_number)
-    if r.status_code != 200:
-        return {"status": "CTT API error", "date": None}
-
-    data = r.json()
-    if data.get("error") is not None:
-        return {"status": "Error en API CTT", "date": None}
-
-    events = data.get("data", {}).get("shipping_history", {}).get("events", [])
-    if not events:
-        return {"status": "Sin eventos", "date": None}
-
-    last_event = events[-1]
-    return {
-        "status": last_event.get("description", "Estado desconocido"),
-        "date": last_event.get("event_date")  # Fecha real del evento
-    }
-
-def map_ctt_to_shopify(status):
-    """Mapea el estado devuelto por CTT al formato de Shopify."""
-    status_map = {
-        "En reparto": "out_for_delivery",
-        "Entrega hoy": "out_for_delivery",
-        "Entregado": "delivered",
-        "En tránsito": "in_transit",
-        "Recogido": "in_transit",
-        "Pendiente de recepción en CTT Express": "confirmed",
-        "Reparto fallido": "failure"
-    }
-    return status_map.get(status, "in_transit")
 
 def get_last_fulfillment_event(order_id, fulfillment_id):
     """Obtiene el último evento registrado en Shopify con fecha y estado."""
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     r = requests.get(url, headers=headers)
     if r.status_code != 200:
@@ -104,46 +112,119 @@ def get_last_fulfillment_event(order_id, fulfillment_id):
 
     last_event = events[-1]
     last_status = last_event.get("status")
-    last_date = parse(last_event.get("created_at"))
+    last_date_raw = last_event.get("created_at")
+    last_date = parse(last_date_raw) if last_date_raw else None
     return last_status, last_date
 
+
 def create_fulfillment_event(order_id, fulfillment_id, status, event_date=None):
-    """Crea un nuevo evento en Shopify con la fecha real si procede."""
+    """
+    Crea un nuevo evento en Shopify SOLO si:
+      - La fecha del último evento de CTT es HOY (en LOCAL_TZ).
+      - Y no existe ya el mismo estado en Shopify con fecha >= a la de CTT.
+    """
     event_status = map_ctt_to_shopify(status)
-    
+
+    # 1) Validar fecha de CTT = hoy
+    ctt_event_date = to_local_date(event_date, LOCAL_TZ)
+    if not ctt_event_date:
+        log(f"⏭️ Pedido {order_id}: Evento '{status}' ignorado (sin fecha CTT)")
+        return
+
+    if ctt_event_date != today_local(LOCAL_TZ):
+        log(f"⏭️ Pedido {order_id}: Evento '{status}' ignorado, fecha CTT {ctt_event_date} ≠ hoy {today_local(LOCAL_TZ)}")
+        return
+
+    # 2) Evitar duplicados o retrocesos
     last_status, last_date = get_last_fulfillment_event(order_id, fulfillment_id)
-    
     if last_status == event_status:
-        if event_date:
-            ctt_event_date = parse(event_date)
-            if last_date.date() >= ctt_event_date.date():
-                log(f"🔒 Pedido {order_id} ya tiene estado '{event_status}' actualizado para esa fecha, no se crea evento")
+        # Si ya está el mismo estado, comprobamos que no sea para la misma/fecha posterior
+        if last_date:
+            last_local_date = to_local_date(last_date.isoformat(), LOCAL_TZ)
+            if last_local_date and last_local_date >= ctt_event_date:
+                log(f"🔒 Pedido {order_id}: Ya tiene estado '{event_status}' con fecha >= {ctt_event_date}, no se crea evento")
                 return
         else:
-            log(f"ℹ️ Estado sin cambios para pedido {order_id} ({event_status})")
+            log(f"🔒 Pedido {order_id}: Ya tiene estado '{event_status}', no se crea evento")
             return
 
+    # 3) Crear evento nuevo en Shopify
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {
         "event": {
             "status": event_status,
-            "message": f"Estado CTT: {status}"
+            "message": f"Estado CTT: {status}",
         }
     }
     if event_date:
+        # Guardamos created_at para que refleje la hora real del evento CTT
         payload["event"]["created_at"] = parse(event_date).isoformat()
 
     r = requests.post(url, headers=headers, json=payload)
     if r.status_code == 201:
-        log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {status})")
+        log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {status} - {event_date})")
     else:
         log(f"❌ Error al añadir evento en pedido {order_id}: {r.status_code} - {r.text}")
 
+
+# =========================
+# CTT
+# =========================
+def get_ctt_status(tracking_number: str):
+    """Consulta el estado actual desde la API de CTT y devuelve estado + fecha real."""
+    try:
+        r = requests.get(CTT_API_URL + tracking_number, timeout=25)
+    except requests.RequestException as e:
+        return {"status": f"CTT API error: {e}", "date": None}
+
+    if r.status_code != 200:
+        return {"status": f"CTT API error HTTP {r.status_code}", "date": None}
+
+    try:
+        data = r.json()
+    except ValueError:
+        return {"status": "Error parseando JSON CTT", "date": None}
+
+    if data.get("error") is not None:
+        return {"status": "Error en API CTT", "date": None}
+
+    events = data.get("data", {}).get("shipping_history", {}).get("events", [])
+    if not events:
+        return {"status": "Sin eventos", "date": None}
+
+    last_event = events[-1]
+    return {
+        "status": last_event.get("description", "Estado desconocido"),
+        "date": last_event.get("event_date"),  # Fecha real del evento (ISO)
+    }
+
+
+def map_ctt_to_shopify(status: str) -> str:
+    """Mapea el estado devuelto por CTT al formato de Shopify."""
+    status_map = {
+        "En reparto": "out_for_delivery",
+        "Entrega hoy": "out_for_delivery",
+        "Entregado": "delivered",
+        "En tránsito": "in_transit",
+        "Recogido": "in_transit",
+        "Pendiente de recepción en CTT Express": "confirmed",
+        "Reparto fallido": "failure",
+    }
+    return status_map.get(status, "in_transit")
+
+
+# =========================
+# MAIN
+# =========================
 def main():
+    if not ACCESS_TOKEN:
+        log("❌ Falta SHOPIFY_ACCESS_TOKEN en el entorno.")
+        return
+
     orders = get_fulfilled_orders()
     log(f"🔄 Procesando {len(orders)} pedidos...")
 
@@ -152,6 +233,7 @@ def main():
         if not fulfillments:
             continue
 
+        # Si hay múltiples fulfillments, puedes recorrerlos. Aquí tomamos el primero.
         fulfillment = fulfillments[0]
         order_id = order["id"]
         fulfillment_id = fulfillment["id"]
@@ -163,15 +245,20 @@ def main():
 
         # Estado actual y fecha en CTT
         ctt_result = get_ctt_status(tracking_number)
-        ctt_status = ctt_result["status"]
+        ctt_status = ctt_result["status"] or ""
         ctt_date = ctt_result["date"]
 
         if "error" in ctt_status.lower():
             log(f"⚠️ Error con CTT para {order_id}: {ctt_status}")
             continue
 
-        # Crear o actualizar evento solo si hay cambio
+        if ctt_status in ("Sin eventos", "Estado desconocido"):
+            log(f"ℹ️ Pedido {order_id}: {ctt_status}")
+            continue
+
+        # Crear/actualizar evento SOLO si la fecha CTT es hoy (control dentro de la función)
         create_fulfillment_event(order_id, fulfillment_id, ctt_status, event_date=ctt_date)
+
 
 if __name__ == "__main__":
     main()
