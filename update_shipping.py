@@ -81,7 +81,7 @@ def map_ctt_to_shopify(status):
         "Entregado": "delivered",
         "En tránsito": "in_transit",
         "Recogido": "in_transit",
-        "Grabado": "confirmed",
+        "Pendiente de recepción en CTT Express": "confirmed",
         "Reparto fallido": "failure"
     }
     return status_map.get(status, "in_transit")
