@@ -1,3 +1,4 @@
+import unicodeddata
 import os
 import time
 import requests
@@ -6,7 +7,6 @@ import datetime as dt
 from datetime import datetime
 from dateutil.parser import parse
 from zoneinfo import ZoneInfo
-import unicodeddata
 
 # =========================
 # CONFIG
