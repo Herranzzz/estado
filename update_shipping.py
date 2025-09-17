@@ -26,7 +26,7 @@ LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
 LOG_FILE = "logs_actualizacion_envios.txt"
 
 # Ventana de días aceptada para eventos CTT (p. ej., aceptar entregas de los últimos 7 días)
-CTT_DAYS_WINDOW = int(os.getenv("CTT_DAYS_WINDOW", "7"))
+CTT_DAYS_WINDOW = int(os.getenv("CTT_DAYS_WINDOW", "14"))
 
 # Pausa entre llamadas a la API de Shopify (ms → seg)
 SHOPIFY_POST_SLEEP_SEC = float(os.getenv("SHOPIFY_POST_SLEEP_SEC", "0.2"))
