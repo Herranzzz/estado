@@ -1,4 +1,4 @@
-import unicodeddata
+import unicodedata
 import os
 import time
 import requests
