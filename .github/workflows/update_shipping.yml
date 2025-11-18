@@ -1,17 +1,23 @@
 name: Actualizar estados Shopify CTT
 
+permissions:
+  contents: read   # 🔥 Esto es lo que te faltaba para que checkout funcione
+
 on:
   schedule:
     - cron: "*/25 * * * *"  # Ejecuta cada 25 minutos
-  workflow_dispatch:       # Permite ejecución manual
+  workflow_dispatch:
 
 jobs:
   update-shipping-status:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Clonar repositorio
+      - name: Clonar repositorio (con reintentos)
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 1    # Más rápido y evita fallos
+          lfs: false
 
       - name: Configurar Python
         uses: actions/setup-python@v4
@@ -24,5 +30,5 @@ jobs:
       - name: Ejecutar script
         env:
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          LOCAL_TZ: "Europe/Madrid"   # o "America/Mexico_City" si quieres que se compare con tu hora local en MX
+          LOCAL_TZ: "Europe/Madrid"
         run: python update_shipping.py
