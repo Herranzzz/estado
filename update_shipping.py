@@ -123,6 +123,12 @@ def get_fulfilled_orders(limit=ORDERS_LIMIT):
 
 
 def get_last_fulfillment_event(order_id, fulfillment_id):
+    """
+    Devuelve:
+      - last_status: estado del ÚLTIMO evento (por fecha)
+      - last_date: fecha del último evento
+      - has_delivered: True si existe ALGÚN evento con status 'delivered'
+    """
     url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -132,11 +138,11 @@ def get_last_fulfillment_event(order_id, fulfillment_id):
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200:
         log(f"❌ No se pudo obtener eventos para {order_id}: {r.status_code}")
-        return None, None
+        return None, None, False
 
     events = r.json().get("events", [])
     if not events:
-        return None, None
+        return None, None, False
 
     events_sorted = sorted(events, key=lambda e: e.get("created_at") or "")
     last_event = events_sorted[-1]
@@ -145,7 +151,10 @@ def get_last_fulfillment_event(order_id, fulfillment_id):
     last_date_raw = last_event.get("created_at")
     last_date = parse(last_date_raw) if last_date_raw else None
 
-    return last_status, last_date
+    # 👇 importante: ver si ya hubo algún 'delivered'
+    has_delivered = any(e.get("status") == "delivered" for e in events)
+
+    return last_status, last_date, has_delivered
 
 
 # =========================
@@ -173,12 +182,17 @@ def create_fulfillment_event(
         )
         return
 
-    last_status, last_date = get_last_fulfillment_event(order_id, fulfillment_id)
+    last_status, last_date, has_delivered = get_last_fulfillment_event(order_id, fulfillment_id)
     last_local_date = to_local_date(last_date.isoformat(), LOCAL_TZ) if last_date else None
 
-    # 🚫 BLOQUE CLAVE: si ya está entregado en Shopify, no tocarlo más
+    # 🚫 NUEVO: si ya hubo algún delivered, no volvemos a crear delivered
+    if event_status == "delivered" and has_delivered:
+        log(f"⛔ Pedido {order_id}: Ya tiene al menos un evento 'delivered'. No se crea otro.")
+        return
+
+    # Seguridad extra: si el último evento es delivered, tampoco tocamos
     if last_status == "delivered":
-        log(f"⛔ Pedido {order_id}: Ya entregado en Shopify. No se actualiza.")
+        log(f"⛔ Pedido {order_id}: Último evento es 'delivered'. No se actualiza.")
         return
 
     # Lógica normal de progreso
