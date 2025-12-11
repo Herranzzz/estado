@@ -1,11 +1,11 @@
 name: Actualizar estados Shopify CTT
 
 permissions:
-  contents: read   # 🔥 Esto es lo que te faltaba para que checkout funcione
+  contents: read
 
 on:
   schedule:
-    - cron: "*/25 * * * *"  # Ejecuta cada 25 minutos
+    - cron: "*/25 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,7 +16,7 @@ jobs:
       - name: Clonar repositorio (con reintentos)
         uses: actions/checkout@v3
         with:
-          fetch-depth: 1    # Más rápido y evita fallos
+          fetch-depth: 1
           lfs: false
 
       - name: Configurar Python
@@ -29,6 +29,7 @@ jobs:
 
       - name: Ejecutar script
         env:
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          LOCAL_TZ: "Europe/Madrid"
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}  # este sí debe ser secreto
+          SHOPIFY_STORE_DOMAIN: "dondefue.myshopify.com"             # este NO hace falta ocultarlo
+          ORDERS_LIMIT: "250"
         run: python update_shipping.py
