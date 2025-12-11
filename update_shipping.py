@@ -4,9 +4,12 @@
 """
 Sincroniza el estado de los envíos de CTT con Shopify y crea fulfillment events.
 
-Regla importante:
-- Si un fulfillment ya tiene un evento 'delivered' en Shopify, NO se vuelve a actualizar,
-  aunque el script se ejecute cada día.
+Requisitos importantes:
+
+- Usa la API de CTT (wct.cttexpress.com) para obtener el último evento.
+- Mapea el texto de CTT a estados de fulfillment event de Shopify.
+- NO vuelve a marcar como entregado un fulfillment que ya tiene un event 'delivered'
+  en Shopify (idempotente a nivel de fulfillment).
 """
 
 import os
@@ -20,13 +23,15 @@ import unicodedata
 # =========================
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-# Si no viene por entorno, por defecto usamos tu dominio real
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "dondefue.myshopify.com")
+# Debes pasar esto en el workflow:
+# SHOPIFY_STORE_DOMAIN: dondefue.myshopify.com
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "TU-TIENDA.myshopify.com")
 
 # Límite de pedidos a procesar por ejecución
 ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "250"))
 
 LOG_FILE = "logs_actualizacion_envios.txt"
+
 SHOPIFY_API_VERSION = "2024-01"
 
 
@@ -72,6 +77,7 @@ def shopify_headers() -> dict:
 def get_fulfilled_orders(limit: int = ORDERS_LIMIT) -> t.List[dict]:
     """
     Recupera pedidos con fulfillments para actualizar eventos.
+    Ajusta filtros según lo que quieras considerar.
     """
     url = (
         f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/"
@@ -92,11 +98,8 @@ def get_fulfilled_orders(limit: int = ORDERS_LIMIT) -> t.List[dict]:
 
 def has_delivered_event(order_id: int, fulfillment_id: int) -> bool:
     """
-    Devuelve True si este fulfillment YA tiene un fulfillment event con status 'delivered'.
-
-    Esto hace que:
-    - Si ya marcamos como entregado una vez, no se vuelva a crear NINGÚN evento más
-      para ese fulfillment en ejecuciones posteriores.
+    Devuelve True si el fulfillment ya tiene un fulfillment_event con status 'delivered'
+    en Shopify. Esto hace que el script sea idempotente para entregados.
     """
     url = (
         f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/"
@@ -108,30 +111,26 @@ def has_delivered_event(order_id: int, fulfillment_id: int) -> bool:
         resp = requests.get(url, headers=shopify_headers(), timeout=30)
         if resp.status_code >= 400:
             log(
-                f"⚠️ No se pudieron recuperar fulfillment events para "
+                f"⚠️ No se pudieron obtener fulfillment events para "
                 f"{order_id}/{fulfillment_id}: {resp.status_code} {resp.text}"
             )
             return False
 
         data = resp.json()
-        events = data.get("fulfillment_events", []) or data.get("events", [])
+        events = data.get("fulfillment_events", [])
 
         for ev in events:
-            status = ev.get("status")
-            if status == "delivered":
-                log(
-                    f"⏭️ SKIP {order_id}/{fulfillment_id}: "
-                    f"ya tiene fulfillment event 'delivered' en Shopify."
-                )
+            if normalize_text(ev.get("status")) == "delivered":
                 return True
 
         return False
 
     except Exception as e:
         log(
-            f"⚠️ Excepción consultando fulfillment events para "
+            f"⚠️ Excepción leyendo fulfillment events de "
             f"{order_id}/{fulfillment_id}: {e}"
         )
+        # Ante error al leer eventos, preferimos NO bloquear la actualización
         return False
 
 
@@ -163,7 +162,8 @@ def create_fulfillment_event(
 
     # happened_at en ISO
     if event_date:
-        happened_at = event_date  # asumimos que viene bien formado
+        # Lo usamos tal cual; CTT ya da una fecha parseable por JS/ISO
+        happened_at = event_date
     else:
         happened_at = datetime.now(timezone.utc).isoformat()
 
@@ -195,7 +195,7 @@ def create_fulfillment_event(
 
 
 # =========================
-# CTT HELPERS (ADÁPTALO A TU API REAL)
+# CTT HELPERS
 # =========================
 
 def get_ctt_status(tracking_number: str) -> dict:
@@ -203,28 +203,51 @@ def get_ctt_status(tracking_number: str) -> dict:
     Devuelve un dict con:
       {
         "status": "Texto devuelto por CTT",
-        "date": "2025-01-01T12:34:56Z" (opcional)
+        "date":   "fecha del último evento" (cadena tal como viene de CTT, o None)
       }
 
-    ⚠️ SUSTITUYE ESTA FUNCIÓN POR TU IMPLEMENTACIÓN REAL DE LA API DE CTT.
+    Implementado usando la misma API que tu Apps Script:
+    https://wct.cttexpress.com/p_track_redis.php?sc=...
     """
-    # EJEMPLO GENÉRICO (ADÁPTALO A TU API REAL):
-    #
-    # url = "https://api.ctt.pt/..."  # endpoint real
-    # params = {"tracking_number": tracking_number}
-    # resp = requests.get(url, params=params, timeout=30)
-    # resp.raise_for_status()
-    # data = resp.json()
-    #
-    # return {
-    #     "status": data["estado"],               # texto del estado
-    #     "date": data.get("fecha_iso", None),    # o None si no hay fecha
-    # }
+    if not tracking_number:
+        return {"status": "", "date": None}
 
-    # Mientras tanto devolvemos un error controlado:
+    api_url = f"https://wct.cttexpress.com/p_track_redis.php?sc={tracking_number}"
+
+    try:
+        resp = requests.get(api_url, timeout=20)
+        if resp.status_code >= 400:
+            return {
+                "status": f"ERROR CTT HTTP {resp.status_code}",
+                "date": None,
+            }
+
+        data = resp.json()
+
+    except Exception as e:
+        return {
+            "status": f"ERROR al llamar a CTT: {e}",
+            "date": None,
+        }
+
+    # Estructura similar a la que usas en Apps Script
+    eventos = (
+        data.get("data", {})
+        .get("shipping_history", {})
+        .get("events")
+    )
+
+    if not eventos:
+        return {"status": "Sin eventos", "date": None}
+
+    ultimo = eventos[-1]
+
+    descripcion = ultimo.get("description") or ""
+    event_date = ultimo.get("event_date")  # la usamos tal cual para Shopify
+
     return {
-        "status": "ERROR: get_ctt_status no está implementado.",
-        "date": None,
+        "status": descripcion,
+        "date": event_date,
     }
 
 
@@ -303,8 +326,13 @@ def main() -> None:
         for fulfillment in fulfillments:
             fulfillment_id = fulfillment["id"]
 
-            # 0) Si YA hay un 'delivered' en Shopify para este fulfillment, no hacemos nada
+            # 0) Si este fulfillment YA tiene un delivered en Shopify, no hacemos nada
             if has_delivered_event(order_id, fulfillment_id):
+                log(
+                    f"⏭️ SKIP {order_id}/{fulfillment_id}: "
+                    f"ya tiene un fulfillment event 'delivered' en Shopify. "
+                    f"No se crea ningún evento nuevo para este fulfillment."
+                )
                 continue
 
             tracking_numbers: t.List[str] = []
@@ -347,12 +375,12 @@ def main() -> None:
                     event_date=ctt_date,
                 )
 
-                # 2) Logs bonitos según el estado
                 if success:
                     mapped_status = map_ctt_status_to_shopify_status(ctt_status)
+
                     if mapped_status == "delivered":
                         log(
-                            f"✅ Marcado como entregado (sin duplicar): "
+                            f"✅ Marcado como entregado en Shopify: "
                             f"{order_id}/{fulfillment_id} ({tn})"
                         )
                     else:
