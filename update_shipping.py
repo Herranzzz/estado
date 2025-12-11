@@ -1,317 +1,251 @@
-import unicodedata
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Sincroniza el estado de los envíos de CTT con Shopify y crea fulfillment events.
+Incluye protección para NO volver a marcar como entregado un tracking ya entregado.
+"""
+
 import os
-import time
-import requests
 import typing as t
-import datetime as dt
-from datetime import datetime
-from dateutil.parser import parse
-from zoneinfo import ZoneInfo
+import requests
+from datetime import datetime, timezone
+import unicodedata
 
 # =========================
 # CONFIG
 # =========================
 
-SHOP_URL = "https://48d471-2.myshopify.com"
-ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
-LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "TU-TIENDA.myshopify.com")
+
+# Límite de pedidos a procesar por ejecución
+ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "250"))
+
 LOG_FILE = "logs_actualizacion_envios.txt"
+DELIVERED_REGISTRY_FILE = "envios_ya_entregados.txt"  # ← aquí guardamos trackings ya entregados
 
-CTT_DAYS_WINDOW = int(os.getenv("CTT_DAYS_WINDOW", "14"))
-SHOPIFY_POST_SLEEP_SEC = float(os.getenv("SHOPIFY_POST_SLEEP_SEC", "0.2"))
-ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "300"))
+SHOPIFY_API_VERSION = "2024-01"
+
 
 # =========================
-# UTILIDAD
+# HELPERS BÁSICOS
 # =========================
 
-
-def log(message: str):
-    tz = ZoneInfo(LOCAL_TZ)
-    timestamp = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
-    print(message)
-
-
-def to_local_date(date_str: str, tz_name: str) -> t.Optional[dt.date]:
-    if not date_str:
-        return None
+def log(message: str) -> None:
+    """Escribe en log y por pantalla."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {message}"
+    print(line)
     try:
-        parsed = parse(date_str)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
-        local_dt = parsed.astimezone(ZoneInfo(tz_name))
-        return local_dt.date()
-    except Exception as e:
-        log(f"⚠️ No se pudo parsear fecha '{date_str}': {e}")
-        return None
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Si falla el log, no queremos romper la ejecución
+        pass
 
 
-def today_local(tz_name: str) -> dt.date:
-    return datetime.now(ZoneInfo(tz_name)).date()
-
-
-def normalize_text(s: str) -> str:
+def normalize_text(s: t.Optional[str]) -> str:
+    """Normaliza texto: minúsculas, sin tildes, sin espacios extra."""
     if not s:
         return ""
-    s = s.strip().lower()
-    s = "".join(
-        c
-        for c in unicodedata.normalize("NFD", s)
-        if unicodedata.category(c) != "Mn"
-    )
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower().strip()
     return s
 
 
-def status_rank(shopify_status: str) -> int:
-    order = ["confirmed", "in_transit", "out_for_delivery", "failure", "delivered"]
+# =========================
+# REGISTRO DE ENTREGADOS
+# =========================
+
+def is_already_marked_delivered(tracking_number: str) -> bool:
+    """
+    Devuelve True si este tracking ya se marcó como entregado en una ejecución anterior.
+    """
+    if not tracking_number:
+        return False
+
+    if not os.path.exists(DELIVERED_REGISTRY_FILE):
+        return False
+
     try:
-        return order.index(shopify_status)
-    except ValueError:
-        return 0
+        with open(DELIVERED_REGISTRY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip() == tracking_number:
+                    return True
+    except Exception:
+        # Si hay algún problema leyendo el fichero, actuamos como si no estuviera
+        return False
+
+    return False
 
 
-def is_progress(new_status: str, old_status: t.Optional[str]) -> bool:
-    if not old_status:
-        return True
-    return status_rank(new_status) >= status_rank(old_status)
+def register_delivered(tracking_number: str) -> None:
+    """
+    Registra el tracking como entregado para que no se vuelva a actualizar.
+    """
+    if not tracking_number:
+        return
 
-
-def days_between(d1: dt.date, d2: dt.date) -> int:
-    return abs((d2 - d1).days)
+    try:
+        with open(DELIVERED_REGISTRY_FILE, "a", encoding="utf-8") as f:
+            f.write(tracking_number + "\n")
+    except Exception:
+        # Si falla el guardado, al menos no rompemos el script
+        pass
 
 
 # =========================
-# SHOPIFY
+# SHOPIFY HELPERS
 # =========================
 
-
-def get_fulfilled_orders(limit=ORDERS_LIMIT):
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
+def shopify_headers() -> dict:
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
-    all_orders = []
-    url = f"{SHOP_URL}/admin/api/2023-10/orders.json"
+
+def get_fulfilled_orders(limit: int = ORDERS_LIMIT) -> t.List[dict]:
+    """
+    Recupera pedidos con fulfillments para actualizar eventos.
+    Ajusta filtros según lo que quieras considerar.
+    """
+    url = (
+        f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/"
+        f"{SHOPIFY_API_VERSION}/orders.json"
+    )
     params = {
-        "fulfillment_status": "fulfilled",
         "status": "any",
-        "limit": 50,
-        "order": "created_at desc",
+        "fulfillment_status": "fulfilled",
+        "limit": limit,
+        "fields": "id,name,fulfillments",
     }
 
-    while len(all_orders) < limit:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        orders = data.get("orders", [])
-        if not orders:
-            break
-
-        all_orders.extend(orders)
-
-        if "Link" in r.headers and 'rel="next"' in r.headers["Link"]:
-            url = r.links["next"]["url"]
-            params = None
-        else:
-            break
-
-    return all_orders[:limit]
-
-
-def get_last_fulfillment_event(order_id, fulfillment_id):
-    """
-    Devuelve:
-      - last_status: estado del ÚLTIMO evento (por fecha)
-      - last_date: fecha del último evento
-      - has_delivered: True si existe ALGÚN evento con status 'delivered'
-    """
-    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code != 200:
-        log(f"❌ No se pudo obtener eventos para {order_id}: {r.status_code}")
-        return None, None, False
-
-    events = r.json().get("events", [])
-    if not events:
-        return None, None, False
-
-    events_sorted = sorted(events, key=lambda e: e.get("created_at") or "")
-    last_event = events_sorted[-1]
-
-    last_status = last_event.get("status")
-    last_date_raw = last_event.get("created_at")
-    last_date = parse(last_date_raw) if last_date_raw else None
-
-    # 👇 importante: ver si ya hubo algún 'delivered'
-    has_delivered = any(e.get("status") == "delivered" for e in events)
-
-    return last_status, last_date, has_delivered
-
-
-# =========================
-# CREAR EVENTOS
-# =========================
+    resp = requests.get(url, headers=shopify_headers(), params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("orders", [])
 
 
 def create_fulfillment_event(
-    order_id,
-    fulfillment_id,
-    status,
-    event_date=None,
-    days_window=CTT_DAYS_WINDOW,
-):
-    event_status = map_ctt_to_shopify(status)
-    ctt_event_date = to_local_date(event_date, LOCAL_TZ)
+    order_id: int,
+    fulfillment_id: int,
+    ctt_status: str,
+    event_date: t.Optional[str] = None,
+) -> bool:
+    """
+    Crea un fulfillment event en Shopify a partir del estado de CTT.
+    Devuelve True si ha ido bien.
+    """
+    event_status = map_ctt_status_to_shopify_status(ctt_status)
 
-    if not ctt_event_date:
-        log(f"⏭️ Pedido {order_id}: Evento '{status}' ignorado (sin fecha CTT)")
-        return
-
-    if days_between(ctt_event_date, today_local(LOCAL_TZ)) > days_window:
+    # Si no hay estado mapeado, no creamos nada
+    if not event_status:
         log(
-            f"⏭️ Pedido {order_id}: Evento '{status}' fuera de ventana ({ctt_event_date})"
+            f"🔁 Saltando creación de evento para order {order_id}/{fulfillment_id}: "
+            f"no se pudo mapear estado CTT '{ctt_status}'"
         )
-        return
+        return False
 
-    last_status, last_date, has_delivered = get_last_fulfillment_event(order_id, fulfillment_id)
-    last_local_date = to_local_date(last_date.isoformat(), LOCAL_TZ) if last_date else None
+    url = (
+        f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/"
+        f"{SHOPIFY_API_VERSION}/orders/{order_id}/"
+        f"fulfillments/{fulfillment_id}/events.json"
+    )
 
-    # 🚫 NUEVO: si ya hubo algún delivered, no volvemos a crear delivered
-    if event_status == "delivered" and has_delivered:
-        log(f"⛔ Pedido {order_id}: Ya tiene al menos un evento 'delivered'. No se crea otro.")
-        return
+    # happened_at en ISO
+    if event_date:
+        # Confía en que viene en un formato ISO razonable o lo usas tal cual
+        happened_at = event_date
+    else:
+        happened_at = datetime.now(timezone.utc).isoformat()
 
-    # Seguridad extra: si el último evento es delivered, tampoco tocamos
-    if last_status == "delivered":
-        log(f"⛔ Pedido {order_id}: Último evento es 'delivered'. No se actualiza.")
-        return
-
-    # Lógica normal de progreso
-    if last_status and not is_progress(event_status, last_status):
-        if event_status == last_status and last_local_date and (ctt_event_date > last_local_date):
-            # mismo estado pero fecha CTT más nueva -> permitir
-            pass
-        else:
-            log(
-                f"🟡 Pedido {order_id}: Sin progreso ({last_status} -> {event_status}), no se crea evento"
-            )
-            return
-
-    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
     payload = {
         "event": {
             "status": event_status,
-            "message": f"Estado CTT: {status}",
+            "happened_at": happened_at,
+            "message": f"Actualizado desde CTT: {ctt_status}",
         }
     }
 
-    if event_date:
-        try:
-            payload["event"]["created_at"] = parse(event_date).isoformat()
-        except Exception:
-            # si la fecha viene rara, dejamos que Shopify ponga la actual
-            pass
+    try:
+        resp = requests.post(url, headers=shopify_headers(), json=payload, timeout=30)
+        if resp.status_code >= 400:
+            log(
+                f"❌ Error al crear fulfillment event para "
+                f"{order_id}/{fulfillment_id}: {resp.status_code} {resp.text}"
+            )
+            return False
 
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code == 201:
         log(
-            f"✅ Evento '{event_status}' añadido a pedido {order_id} "
-            f"(CTT: {status} - {event_date})"
+            f"📨 Creado fulfillment event '{event_status}' para "
+            f"{order_id}/{fulfillment_id} ({ctt_status})"
         )
-    else:
-        log(
-            f"❌ Error al añadir evento en pedido {order_id}: "
-            f"{r.status_code} - {r.text}"
-        )
-
-    if SHOPIFY_POST_SLEEP_SEC > 0:
-        time.sleep(SHOPIFY_POST_SLEEP_SEC)
+        return True
+    except Exception as e:
+        log(f"❌ Excepción creando fulfillment event: {e}")
+        return False
 
 
 # =========================
-# CTT
+# CTT HELPERS (ADÁPTALO A TU API REAL)
 # =========================
 
+def get_ctt_status(tracking_number: str) -> dict:
+    """
+    Devuelve un dict con:
+      {
+        "status": "Texto devuelto por CTT",
+        "date": "2025-01-01T12:34:56Z" (opcional)
+      }
 
-def get_ctt_status(tracking_number: str):
-    try:
-        r = requests.get(CTT_API_URL + tracking_number.strip(), timeout=25)
-    except requests.RequestException as e:
-        return {"status": f"CTT API error: {e}", "date": None}
-
-    if r.status_code != 200:
-        return {"status": f"CTT API error HTTP {r.status_code}", "date": None}
-
-    try:
-        data = r.json()
-    except ValueError:
-        return {"status": "Error parseando JSON CTT", "date": None}
-
-    if data.get("error") is not None:
-        return {"status": "Error en API CTT", "date": None}
-
-    events = (
-        data.get("data", {})
-        .get("shipping_history", {})
-        .get("events", [])
-    )
-
-    if not events:
-        return {"status": "Sin eventos", "date": None}
-
-    def _safe_parse_date(e):
-        d = e.get("event_date")
-        try:
-            return parse(d)
-        except Exception:
-            return datetime.min.replace(tzinfo=ZoneInfo("UTC"))
-
-    events_sorted = sorted(events, key=_safe_parse_date)
-    last_event = events_sorted[-1]
-
+    IMPORTANTE:
+    - Sustituye esta función por tu implementación real de CTT.
+    - Aquí hay solo un esqueleto para que veas la estructura.
+    """
+    # TODO: Implementar llamada real a la API de CTT o reutilizar la tuya.
+    # Mientras tanto, devolvemos un error controlado:
     return {
-        "status": last_event.get("description", "Estado desconocido"),
-        "date": last_event.get("event_date"),
+        "status": "ERROR: get_ctt_status no está implementado en este esqueleto.",
+        "date": None,
     }
 
 
-def map_ctt_to_shopify(status: str) -> str:
-    s = normalize_text(status)
+def map_ctt_status_to_shopify_status(ctt_status: str) -> str:
+    """
+    Mapea el texto de estado de CTT a los estados de fulfillment event de Shopify:
+    - "in_transit"
+    - "out_for_delivery"
+    - "delivered"
+    - "failure"
+    - "ready_for_pickup"
+    - "attempted_delivery"
+    """
+    s = normalize_text(ctt_status)
+
+    if not s:
+        return ""
 
     # Entregado
-    if "entregado" in s or "entrega realizada" in s or "pod" in s:
+    if "entreg" in s or "reparto finalizado" in s:
         return "delivered"
 
-    # En reparto
-    if "en reparto" in s or "entrega hoy" in s or "salida a reparto" in s:
-        return "out_for_delivery"
+    # Intentos de entrega / ausente
+    if "ausente" in s or "ausencia" in s or "intento" in s:
+        return "attempted_delivery"
 
-    # Incidencias / fallo
-    if (
-        "reparto fallido" in s
-        or "ausente" in s
-        or ("direccion" in s and "incorrect" in s)
-        or "incidencia" in s
-    ):
+    # Devoluciones / incidencias gordas
+    if "devuelto" in s or "devolucion" in s or "incidencia" in s:
         return "failure"
 
-    # En tránsito
+    # Reparto / clasificación / en ruta
     if (
-        "en transito" in s
-        or "recogido" in s
+        "reparto" in s
+        or "en reparto" in s
+        or "salida a reparto" in s
         or "clasificacion" in s
         or "ruta" in s
     ):
@@ -323,7 +257,7 @@ def map_ctt_to_shopify(status: str) -> str:
         or "admitido" in s
         or "aceptado" in s
     ):
-        return "confirmed"
+        return "in_transit"
 
     # Por defecto lo tratamos como en tránsito
     return "in_transit"
@@ -333,10 +267,13 @@ def map_ctt_to_shopify(status: str) -> str:
 # MAIN
 # =========================
 
-
-def main():
-    if not ACCESS_TOKEN:
+def main() -> None:
+    if not SHOPIFY_ACCESS_TOKEN:
         log("❌ Falta SHOPIFY_ACCESS_TOKEN en el entorno.")
+        return
+
+    if not SHOPIFY_STORE_DOMAIN:
+        log("❌ Falta SHOPIFY_STORE_DOMAIN en el entorno.")
         return
 
     orders = get_fulfilled_orders(limit=ORDERS_LIMIT)
@@ -353,7 +290,7 @@ def main():
             fulfillment_id = fulfillment["id"]
 
             tracking_numbers: t.List[str] = []
-
+            # Shopify puede tener tracking_numbers (lista) o tracking_number (string)
             if fulfillment.get("tracking_numbers"):
                 tracking_numbers = [
                     tn for tn in fulfillment["tracking_numbers"] if tn
@@ -366,9 +303,17 @@ def main():
                 continue
 
             for tn in tracking_numbers:
+                # 0) Si ya está registrado como entregado, no hacemos NADA
+                if is_already_marked_delivered(tn):
+                    log(
+                        f"⏭️ SKIP {order_id}/{fulfillment_id} ({tn}): "
+                        f"ya estaba registrado como entregado. No se crea nuevo evento."
+                    )
+                    continue
+
                 ctt_result = get_ctt_status(tn)
-                ctt_status = (ctt_result["status"] or "").strip()
-                ctt_date = ctt_result["date"]
+                ctt_status = (ctt_result.get("status") or "").strip()
+                ctt_date = ctt_result.get("date")
 
                 if "error" in normalize_text(ctt_status):
                     log(
@@ -384,12 +329,30 @@ def main():
                     )
                     continue
 
-                create_fulfillment_event(
+                # 1) Creamos el fulfillment event correspondiente
+                success = create_fulfillment_event(
                     order_id,
                     fulfillment_id,
                     ctt_status,
                     event_date=ctt_date,
                 )
+
+                # 2) Si se ha creado y el estado es de entrega, registramos el tracking
+                if success:
+                    mapped_status = map_ctt_status_to_shopify_status(ctt_status)
+                    is_delivered = mapped_status == "delivered"
+
+                    if is_delivered:
+                        register_delivered(tn)
+                        log(
+                            f"✅ Marcado como entregado y registrado: "
+                            f"{order_id}/{fulfillment_id} ({tn})"
+                        )
+                    else:
+                        log(
+                            f"🚚 Actualizado estado {order_id}/{fulfillment_id} "
+                            f"({tn}): {ctt_status}"
+                        )
 
 
 if __name__ == "__main__":
