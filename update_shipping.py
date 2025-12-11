@@ -20,7 +20,7 @@ import unicodedata
 # =========================
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")  # p.ej. "dondefue.myshopify.com"
+SHOPIFY_STORE_DOMAIN: "dondefue.myshopify.com"             # este NO hace falta ocultarlo
 
 # Límite de pedidos a procesar por ejecución
 ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "250"))
