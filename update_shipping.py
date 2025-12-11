@@ -3,7 +3,8 @@
 
 """
 Sincroniza el estado de los envíos de CTT con Shopify y crea fulfillment events.
-Incluye protección para NO volver a marcar como entregado un tracking ya entregado.
+Regla importante:
+- Si un fulfillment ya tiene un evento 'delivered' en Shopify, NO se vuelve a actualizar.
 """
 
 import os
@@ -17,14 +18,12 @@ import unicodedata
 # =========================
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "TU-TIENDA.myshopify.com")
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")  # p.ej. "tu-tienda.myshopify.com"
 
 # Límite de pedidos a procesar por ejecución
 ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "250"))
 
 LOG_FILE = "logs_actualizacion_envios.txt"
-DELIVERED_REGISTRY_FILE = "envios_ya_entregados.txt"  # ← aquí guardamos trackings ya entregados
-
 SHOPIFY_API_VERSION = "2024-01"
 
 
@@ -53,47 +52,6 @@ def normalize_text(s: t.Optional[str]) -> str:
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.lower().strip()
     return s
-
-
-# =========================
-# REGISTRO DE ENTREGADOS
-# =========================
-
-def is_already_marked_delivered(tracking_number: str) -> bool:
-    """
-    Devuelve True si este tracking ya se marcó como entregado en una ejecución anterior.
-    """
-    if not tracking_number:
-        return False
-
-    if not os.path.exists(DELIVERED_REGISTRY_FILE):
-        return False
-
-    try:
-        with open(DELIVERED_REGISTRY_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip() == tracking_number:
-                    return True
-    except Exception:
-        # Si hay algún problema leyendo el fichero, actuamos como si no estuviera
-        return False
-
-    return False
-
-
-def register_delivered(tracking_number: str) -> None:
-    """
-    Registra el tracking como entregado para que no se vuelva a actualizar.
-    """
-    if not tracking_number:
-        return
-
-    try:
-        with open(DELIVERED_REGISTRY_FILE, "a", encoding="utf-8") as f:
-            f.write(tracking_number + "\n")
-    except Exception:
-        # Si falla el guardado, al menos no rompemos el script
-        pass
 
 
 # =========================
@@ -130,6 +88,48 @@ def get_fulfilled_orders(limit: int = ORDERS_LIMIT) -> t.List[dict]:
     return data.get("orders", [])
 
 
+def has_delivered_event(order_id: int, fulfillment_id: int) -> bool:
+    """
+    Devuelve True si este fulfillment YA tiene un fulfillment event con status 'delivered'.
+    Así evitamos volver a crear eventos de entrega y disparar notificaciones duplicadas.
+    """
+    url = (
+        f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/"
+        f"{SHOPIFY_API_VERSION}/orders/{order_id}/"
+        f"fulfillments/{fulfillment_id}/events.json"
+    )
+
+    try:
+        resp = requests.get(url, headers=shopify_headers(), timeout=30)
+        if resp.status_code >= 400:
+            log(
+                f"⚠️ No se pudieron recuperar fulfillment events para "
+                f"{order_id}/{fulfillment_id}: {resp.status_code} {resp.text}"
+            )
+            return False
+
+        data = resp.json()
+        events = data.get("fulfillment_events", []) or data.get("events", [])
+
+        for ev in events:
+            status = ev.get("status")
+            if status == "delivered":
+                log(
+                    f"⏭️ SKIP {order_id}/{fulfillment_id}: "
+                    f"ya tiene fulfillment event 'delivered' en Shopify."
+                )
+                return True
+
+        return False
+
+    except Exception as e:
+        log(
+            f"⚠️ Excepción consultando fulfillment events para "
+            f"{order_id}/{fulfillment_id}: {e}"
+        )
+        return False
+
+
 def create_fulfillment_event(
     order_id: int,
     fulfillment_id: int,
@@ -158,8 +158,7 @@ def create_fulfillment_event(
 
     # happened_at en ISO
     if event_date:
-        # Confía en que viene en un formato ISO razonable o lo usas tal cual
-        happened_at = event_date
+        happened_at = event_date  # asumimos que viene en un formato aceptable
     else:
         happened_at = datetime.now(timezone.utc).isoformat()
 
@@ -202,14 +201,24 @@ def get_ctt_status(tracking_number: str) -> dict:
         "date": "2025-01-01T12:34:56Z" (opcional)
       }
 
-    IMPORTANTE:
-    - Sustituye esta función por tu implementación real de CTT.
-    - Aquí hay solo un esqueleto para que veas la estructura.
+    ⚠️ SUSTITUYE ESTA FUNCIÓN POR TU IMPLEMENTACIÓN REAL DE LA API DE CTT.
     """
-    # TODO: Implementar llamada real a la API de CTT o reutilizar la tuya.
-    # Mientras tanto, devolvemos un error controlado:
+    # EJEMPLO GENÉRICO (ADÁPTALO A TU API REAL):
+
+    # url = "https://api.ctt.pt/..."  # endpoint real
+    # params = {"tracking_number": tracking_number}
+    # resp = requests.get(url, params=params, timeout=30)
+    # resp.raise_for_status()
+    # data = resp.json()
+    #
+    # return {
+    #     "status": data["estado"],               # texto del estado
+    #     "date": data.get("fecha_iso", None),    # o None si no hay fecha
+    # }
+
+    # Mientras tanto, devuelve un error controlado:
     return {
-        "status": "ERROR: get_ctt_status no está implementado en este esqueleto.",
+        "status": "ERROR: get_ctt_status no está implementado.",
         "date": None,
     }
 
@@ -276,6 +285,13 @@ def main() -> None:
         log("❌ Falta SHOPIFY_STORE_DOMAIN en el entorno.")
         return
 
+    if "TU-TIENDA" in SHOPIFY_STORE_DOMAIN.upper():
+        log(
+            f"❌ SHOPIFY_STORE_DOMAIN sigue siendo un placeholder: "
+            f"{SHOPIFY_STORE_DOMAIN}. Configura tu dominio real de Shopify."
+        )
+        return
+
     orders = get_fulfilled_orders(limit=ORDERS_LIMIT)
     log(f"📦 Procesando {len(orders)} pedidos...")
 
@@ -288,6 +304,11 @@ def main() -> None:
 
         for fulfillment in fulfillments:
             fulfillment_id = fulfillment["id"]
+
+            # 0) Si YA hay un 'delivered' en Shopify para este fulfillment, no hacemos nada
+            if has_delivered_event(order_id, fulfillment_id):
+                # Ya hemos escrito el log dentro de la función
+                continue
 
             tracking_numbers: t.List[str] = []
             # Shopify puede tener tracking_numbers (lista) o tracking_number (string)
@@ -303,14 +324,6 @@ def main() -> None:
                 continue
 
             for tn in tracking_numbers:
-                # 0) Si ya está registrado como entregado, no hacemos NADA
-                if is_already_marked_delivered(tn):
-                    log(
-                        f"⏭️ SKIP {order_id}/{fulfillment_id} ({tn}): "
-                        f"ya estaba registrado como entregado. No se crea nuevo evento."
-                    )
-                    continue
-
                 ctt_result = get_ctt_status(tn)
                 ctt_status = (ctt_result.get("status") or "").strip()
                 ctt_date = ctt_result.get("date")
@@ -337,21 +350,18 @@ def main() -> None:
                     event_date=ctt_date,
                 )
 
-                # 2) Si se ha creado y el estado es de entrega, registramos el tracking
+                # 2) Logs bonitos según el estado
                 if success:
                     mapped_status = map_ctt_status_to_shopify_status(ctt_status)
-                    is_delivered = mapped_status == "delivered"
-
-                    if is_delivered:
-                        register_delivered(tn)
+                    if mapped_status == "delivered":
                         log(
-                            f"✅ Marcado como entregado y registrado: "
+                            f"✅ Marcado como entregado (sin duplicar): "
                             f"{order_id}/{fulfillment_id} ({tn})"
                         )
                     else:
                         log(
                             f"🚚 Actualizado estado {order_id}/{fulfillment_id} "
-                            f"({tn}): {ctt_status}"
+                            f"({tn}): {ctt_status} -> {mapped_status}"
                         )
 
 
