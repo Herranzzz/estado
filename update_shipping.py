@@ -20,7 +20,8 @@ import unicodedata
 # =========================
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-SHOPIFY_STORE_DOMAIN: "dondefue.myshopify.com"             # este NO hace falta ocultarlo
+# Si no viene por entorno, por defecto usamos tu dominio real
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "dondefue.myshopify.com")
 
 # Límite de pedidos a procesar por ejecución
 ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "250"))
@@ -287,13 +288,6 @@ def main() -> None:
 
     if not SHOPIFY_STORE_DOMAIN:
         log("❌ Falta SHOPIFY_STORE_DOMAIN en el entorno.")
-        return
-
-    if "TU-TIENDA" in SHOPIFY_STORE_DOMAIN.upper():
-        log(
-            f"❌ SHOPIFY_STORE_DOMAIN sigue siendo un placeholder: "
-            f"{SHOPIFY_STORE_DOMAIN}. Configura tu dominio real de Shopify."
-        )
         return
 
     orders = get_fulfilled_orders(limit=ORDERS_LIMIT)
