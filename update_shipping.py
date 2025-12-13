@@ -364,7 +364,6 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
 
     # 8) Ambiguos
     if has_any(
-        "pendiente", "pendiente de recepcion", "pendiente de recepción",
         "aguardando", "a aguardar", "preaviso", "pre-aviso", "informacion recibida",
         "info recibida", "etiqueta creada", "label created"
     ):
