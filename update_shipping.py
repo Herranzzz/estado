@@ -4,7 +4,7 @@
 """
 Sincroniza el estado de los envíos de CTT con Shopify y crea fulfillment events.
 
-- Consulta CTT para obtener el último estado del tracking.
+- Consulta CTT (endpoint p_track_redis.php) para obtener el último estado del tracking.
 - Mapea el texto de CTT a estados de fulfillment event de Shopify.
 - Idempotente:
   - Si un fulfillment ya tiene un event 'delivered', no se toca más.
@@ -29,10 +29,10 @@ ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "50"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 
 # --- CTT ---
-# Define un endpoint que reciba el tracking en {tracking}
-# Ejemplo (ficticio): https://wct.cttexpress.com/api/track/{tracking}
-CTT_TRACKING_ENDPOINT = os.getenv("CTT_TRACKING_ENDPOINT", "").strip()
-CTT_API_KEY = os.getenv("CTT_API_KEY", "").strip()  # si aplica
+# Endpoint real (igual que tu Apps Script):
+# https://wct.cttexpress.com/p_track_redis.php?sc={tracking}
+DEFAULT_CTT_TRACKING_ENDPOINT = "https://wct.cttexpress.com/p_track_redis.php?sc={tracking}"
+CTT_TRACKING_ENDPOINT = os.getenv("CTT_TRACKING_ENDPOINT", DEFAULT_CTT_TRACKING_ENDPOINT).strip()
 
 # Si tu CTT requiere headers/cookies específicos, puedes ampliarlo aquí
 CTT_HEADERS_EXTRA = os.getenv("CTT_HEADERS_EXTRA", "").strip()
@@ -51,8 +51,6 @@ def require_env() -> bool:
         missing.append("SHOPIFY_ACCESS_TOKEN")
     if not SHOPIFY_STORE_DOMAIN or "myshopify.com" not in SHOPIFY_STORE_DOMAIN:
         missing.append("SHOPIFY_STORE_DOMAIN (ej: dondefue.myshopify.com)")
-    if not CTT_TRACKING_ENDPOINT:
-        missing.append("CTT_TRACKING_ENDPOINT")
 
     if missing:
         log("❌ Faltan variables de entorno:")
@@ -119,8 +117,7 @@ def shopify_post(path: str, payload: dict) -> dict:
 
 def get_fulfilled_orders(limit: int = 50) -> t.List[dict]:
     """
-    Pedidos con fulfillment_status 'shipped'/'fulfilled' dependen del flujo.
-    Aquí usamos 'shipped' (los que tienen fulfillments con tracking normalmente).
+    Pedidos con fulfillment_status 'shipped' (los que suelen tener fulfillments con tracking).
     """
     data = shopify_get(
         "orders.json",
@@ -166,17 +163,16 @@ def create_fulfillment_event(
         log(f"ℹ️ {order_id}/{fulfillment_id}: estado CTT ambiguo/no mapeable -> NO se crea evento ({ctt_status_text})")
         return False
 
-    # Idempotencia: no duplicar
+    # Idempotencia: no duplicar mismo status
     if has_event_status(order_id, fulfillment_id, mapped):
         log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya existe evento '{mapped}'")
         return False
 
     happened_at = None
     if event_date:
-        # intentamos parsear ISO; si falla, lo ignoramos
         try:
-            # si viene sin tz, asumimos UTC
-            dt = datetime.fromisoformat(event_date.replace("Z", "+00:00"))
+            # event_date suele venir en ISO; si viene con Z, normalizamos
+            dt = datetime.fromisoformat(str(event_date).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             happened_at = dt.astimezone(timezone.utc).isoformat()
@@ -205,55 +201,38 @@ def create_fulfillment_event(
 
 def get_ctt_status(tracking_number: str) -> dict:
     """
-    Llama a CTT y devuelve dict con:
-      - status: str (texto del último evento)
-      - date: str ISO opcional
+    Endpoint real (igual que tu Apps Script):
+      https://wct.cttexpress.com/p_track_redis.php?sc={tracking}
+
+    Devuelve:
+      - status: str (description del último evento)
+      - date: str (event_date del último evento) o None
     """
     endpoint = CTT_TRACKING_ENDPOINT.format(tracking=tracking_number)
 
     headers = {"Accept": "application/json"}
-    if CTT_API_KEY:
-        # Si tu CTT usa otra cabecera (Authorization/Bearer/etc.), cámbialo aquí.
-        headers["X-API-KEY"] = CTT_API_KEY
-
     headers.update(parse_headers_extra(CTT_HEADERS_EXTRA))
 
     r = requests.get(endpoint, headers=headers, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
 
-    # Intento: JSON estándar
     data = r.json()
 
-    # ---- ADAPTA ESTA PARTE A TU RESPUESTA REAL DE CTT ----
-    # Buscamos algo parecido a:
-    # data["last_event"]["description"], data["last_event"]["date"]
-    # o una lista data["events"] ordenada por fecha, etc.
+    # Estructura esperada:
+    # data["data"]["shipping_history"]["events"] -> lista de eventos
+    events = (
+        data.get("data", {})
+            .get("shipping_history", {})
+            .get("events", [])
+    )
 
-    # Caso 1: { "status": "...", "date": "..." }
-    if isinstance(data, dict) and "status" in data:
-        return {
-            "status": str(data.get("status") or "").strip(),
-            "date": (data.get("date") or None),
-        }
+    if isinstance(events, list) and events:
+        last = events[-1] or {}
+        status = str(last.get("description") or "").strip()
+        date = last.get("event_date") or None
+        return {"status": status or "Estado desconocido", "date": date}
 
-    # Caso 2: { "events": [ {"description": "...", "date": "..."}, ... ] }
-    if isinstance(data, dict) and isinstance(data.get("events"), list) and data["events"]:
-        last = data["events"][-1]
-        return {
-            "status": str(last.get("description") or last.get("status") or "").strip(),
-            "date": (last.get("date") or last.get("datetime") or None),
-        }
-
-    # Caso 3: lista de eventos directamente
-    if isinstance(data, list) and data:
-        last = data[-1]
-        if isinstance(last, dict):
-            return {
-                "status": str(last.get("description") or last.get("status") or "").strip(),
-                "date": (last.get("date") or last.get("datetime") or None),
-            }
-
-    return {"status": "Estado desconocido", "date": None}
+    return {"status": "Sin eventos", "date": None}
 
 # =========================
 # MAPPING CTT -> SHOPIFY
@@ -295,7 +274,7 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     ):
         return "delivered"
 
-    # 2) FAILURE
+    # 2) FAILURE (devoluciones/incidencias graves)
     if has_any(
         "devolucion", "devolucao", "retorno", "retornado",
         "en devolucion", "en devolución", "devuelto", "devolvido",
@@ -307,7 +286,7 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     ):
         return "failure"
 
-    # 3) ATTEMPTED DELIVERY
+    # 3) ATTEMPTED DELIVERY (intento fallido)
     if has_any(
         "intento", "tentativa",
         "ausente", "nao foi possivel entregar", "não foi possível entregar",
@@ -332,21 +311,20 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     if has_any(
         "en reparto", "en distribucion", "en distribución",
         "saiu para entrega", "saiu p/ entrega", "em distribuicao", "em distribuição",
-        "out for delivery", "repartidor", "en ruta de entrega", "en ruta"
+        "out for delivery", "repartidor", "en ruta de entrega", "en ruta",
+        "entrega hoy"
     ):
         return "out_for_delivery"
 
     # 6) CONFIRMED
+    # IMPORTANTE: "Pendiente de recepción en CTT Express" -> normaliza a "pendiente de recepcion ..."
     if has_any(
+        "pendiente de recepcion",
         "admitido", "admitida",
-        "recogido", "recolhido", "recolhida",
         "aceptado", "aceite", "aceite pela ctt", "aceite pela rede",
-        "registrado", "registado", "registration", "recebido", "recebida",
+        "registrado", "registado", "recebido", "recebida",
         "entrada en red", "entrada em rede",
-
-        # ✅ AÑADIDO: “Pendiente de recepción en CTT Express”
-        "pendiente de recepcion"
-
+        "grabado"
     ):
         return "confirmed"
 
@@ -358,88 +336,13 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
         "clasificado", "classificado",
         "en plataforma", "hub", "en centro", "en almac", "almacen", "armazem",
         "salida de", "salio de", "saida de", "departed",
-        "llegada a", "chegada a", "arrived"
+        "llegada a", "chegada a", "arrived",
+        "enviado",
+        "cambio direccion y fecha de entrega", "cambio dirección y fecha de entrega"
     ):
         return "in_transit"
 
-    # 8) Ambiguos
+    # 8) Ambiguos (NO crear evento)
     if has_any(
-        "aguardando", "a aguardar", "preaviso", "pre-aviso", "informacion recibida",
-        "info recibida", "etiqueta creada", "label created"
-    ):
-        return None
-
-    return None
-
-# =========================
-# MAIN
-# =========================
-
-def main() -> None:
-    if not require_env():
-        return
-
-    orders = get_fulfilled_orders(limit=ORDERS_LIMIT)
-    log(f"📦 Procesando {len(orders)} pedidos...")
-
-    for order in orders:
-        fulfillments = order.get("fulfillments", []) or []
-        if not fulfillments:
-            continue
-
-        order_id = int(order["id"])
-
-        for fulfillment in fulfillments:
-            fulfillment_id = int(fulfillment["id"])
-
-            # 0) Idempotencia: si ya hay delivered, no tocar este fulfillment
-            if has_delivered_event(order_id, fulfillment_id):
-                log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya tiene 'delivered' en Shopify.")
-                continue
-
-            tracking_numbers: t.List[str] = []
-
-            if fulfillment.get("tracking_numbers"):
-                tracking_numbers = [tn for tn in fulfillment["tracking_numbers"] if tn]
-            elif fulfillment.get("tracking_number"):
-                tracking_numbers = [fulfillment["tracking_number"]]
-
-            if not tracking_numbers:
-                log(f"⚠️ Pedido {order_id}/{fulfillment_id} sin número de seguimiento")
-                continue
-
-            for tn in tracking_numbers:
-                try:
-                    ctt_result = get_ctt_status(tn)
-                except requests.HTTPError as e:
-                    log(f"⚠️ Error HTTP CTT para {order_id}/{fulfillment_id} ({tn}): {e}")
-                    continue
-                except Exception as e:
-                    log(f"⚠️ Error CTT para {order_id}/{fulfillment_id} ({tn}): {e}")
-                    continue
-
-                ctt_status = (ctt_result.get("status") or "").strip()
-                ctt_date = ctt_result.get("date")
-
-                if not ctt_status or ctt_status in ("Sin eventos", "Estado desconocido"):
-                    log(f"ℹ️ {order_id}/{fulfillment_id} ({tn}): {ctt_status or 'Sin estado'}")
-                    continue
-
-                # Si el texto trae "error" literal, lo tratamos como fallo de consulta
-                if "error" in normalize_text(ctt_status):
-                    log(f"⚠️ Error con CTT para {order_id}/{fulfillment_id} ({tn}): {ctt_status}")
-                    continue
-
-                success = create_fulfillment_event(
-                    order_id,
-                    fulfillment_id,
-                    ctt_status,
-                    event_date=ctt_date,
-                )
-
-                if success:
-                    mapped_status = map_ctt_status_to_shopify_event(ctt_status)
-                    log(f"🚚 Actualizado {order_id}/{fulfillment_id} ({tn}): {ctt_status} -> {mapped_status}")
-
-if __name__ == "__main__":
-    main()
+        "aguardando", "a aguardar", "preaviso", "pre-aviso",
+        "informacion recibida", "info recibi
