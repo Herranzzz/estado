@@ -4,14 +4,17 @@
 """
 Sincroniza el estado de los envíos de CTT con Shopify y crea fulfillment events.
 
-- Consulta CTT (endpoint p_track_redis.php) para obtener el último estado del tracking.
+- Consulta CTT para obtener el último estado del tracking (endpoint p_track_redis.php).
 - Mapea el texto de CTT a estados de fulfillment event de Shopify.
-- Idempotente:
-  - Si un fulfillment ya tiene un event 'delivered', no se toca más.
-  - No crea eventos duplicados (mismo status) para el mismo fulfillment.
+- Idempotencia EXACTA (como has pedido):
+  - SOLO hace SKIP si el fulfillment ya tiene un event 'delivered' en Shopify.
+  - NO hace SKIP por otros estados (confirmed/in_transit/out_for_delivery/etc.).
+- Protección contra rate limit (429) de Shopify con retries + backoff y throttling.
 """
 
 import os
+import time
+import math
 import typing as t
 import requests
 from datetime import datetime, timezone
@@ -22,21 +25,27 @@ import unicodedata
 # =========================
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "TU-TIENDA.myshopify.com")
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "dondefue.myshopify.com")
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-04")
 
 ORDERS_LIMIT = int(os.getenv("ORDERS_LIMIT", "50"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 
 # --- CTT ---
-# Endpoint real (igual que tu Apps Script):
-# https://wct.cttexpress.com/p_track_redis.php?sc={tracking}
-DEFAULT_CTT_TRACKING_ENDPOINT = "https://wct.cttexpress.com/p_track_redis.php?sc={tracking}"
-CTT_TRACKING_ENDPOINT = os.getenv("CTT_TRACKING_ENDPOINT", DEFAULT_CTT_TRACKING_ENDPOINT).strip()
+# Endpoint real (como en tu Apps Script), con placeholder {tracking}
+CTT_TRACKING_ENDPOINT = os.getenv(
+    "CTT_TRACKING_ENDPOINT",
+    "https://wct.cttexpress.com/p_track_redis.php?sc={tracking}"
+).strip()
 
-# Si tu CTT requiere headers/cookies específicos, puedes ampliarlo aquí
-CTT_HEADERS_EXTRA = os.getenv("CTT_HEADERS_EXTRA", "").strip()
-# Formato esperado: "Header1:Value1|Header2:Value2"
+# Reintentos Shopify
+SHOPIFY_MAX_RETRIES = int(os.getenv("SHOPIFY_MAX_RETRIES", "8"))
+SHOPIFY_BASE_BACKOFF = float(os.getenv("SHOPIFY_BASE_BACKOFF", "1.0"))  # segundos
+SHOPIFY_BACKOFF_MAX = float(os.getenv("SHOPIFY_BACKOFF_MAX", "30.0"))   # segundos
+
+# Throttle por call limit: si quedan pocas llamadas, duerme un pelín
+SHOPIFY_THROTTLE_MARGIN = int(os.getenv("SHOPIFY_THROTTLE_MARGIN", "5"))
+SHOPIFY_THROTTLE_SLEEP = float(os.getenv("SHOPIFY_THROTTLE_SLEEP", "1.0"))
 
 # =========================
 # HELPERS
@@ -68,20 +77,25 @@ def normalize_text(s: str) -> str:
     s = " ".join(s.split())
     return s
 
-def parse_headers_extra(raw: str) -> dict:
-    headers: dict = {}
-    if not raw:
-        return headers
-    parts = raw.split("|")
-    for p in parts:
-        if ":" not in p:
-            continue
-        k, v = p.split(":", 1)
-        headers[k.strip()] = v.strip()
-    return headers
+def _maybe_throttle_from_headers(headers: t.Mapping[str, str]) -> None:
+    """
+    Shopify REST suele devolver: X-Shopify-Shop-Api-Call-Limit: "used/limit"
+    Si vamos muy justos, dormimos un poco para evitar 429.
+    """
+    try:
+        v = headers.get("X-Shopify-Shop-Api-Call-Limit") or headers.get("x-shopify-shop-api-call-limit")
+        if not v or "/" not in v:
+            return
+        used_s, limit_s = v.split("/", 1)
+        used = int(used_s.strip())
+        limit = int(limit_s.strip())
+        if (limit - used) <= SHOPIFY_THROTTLE_MARGIN:
+            time.sleep(SHOPIFY_THROTTLE_SLEEP)
+    except Exception:
+        return
 
 # =========================
-# SHOPIFY API
+# SHOPIFY API (con retry 429)
 # =========================
 
 def shopify_headers() -> dict:
@@ -95,30 +109,64 @@ def shopify_url(path: str) -> str:
     path = path.lstrip("/")
     return f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/{path}"
 
+def _shopify_request(method: str, path: str, *, params: dict | None = None, json: dict | None = None) -> dict:
+    """
+    Request con:
+      - retry 429/5xx
+      - respeto a Retry-After
+      - throttle por Call-Limit
+    """
+    url = shopify_url(path)
+    last_err: Exception | None = None
+
+    for attempt in range(1, SHOPIFY_MAX_RETRIES + 1):
+        try:
+            r = requests.request(
+                method=method,
+                url=url,
+                headers=shopify_headers(),
+                params=params or {},
+                json=json,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            # throttle (aunque sea success)
+            _maybe_throttle_from_headers(r.headers)
+
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    wait_s = float(retry_after)
+                else:
+                    wait_s = min(SHOPIFY_BACKOFF_MAX, SHOPIFY_BASE_BACKOFF * (2 ** (attempt - 1)))
+                log(f"⚠️ Shopify 429 (rate limit). Esperando {wait_s:.1f}s (intento {attempt}/{SHOPIFY_MAX_RETRIES})")
+                time.sleep(wait_s)
+                continue
+
+            if 500 <= r.status_code < 600:
+                wait_s = min(SHOPIFY_BACKOFF_MAX, SHOPIFY_BASE_BACKOFF * (2 ** (attempt - 1)))
+                log(f"⚠️ Shopify {r.status_code}. Reintentando en {wait_s:.1f}s (intento {attempt}/{SHOPIFY_MAX_RETRIES})")
+                time.sleep(wait_s)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException as e:
+            last_err = e
+            wait_s = min(SHOPIFY_BACKOFF_MAX, SHOPIFY_BASE_BACKOFF * (2 ** (attempt - 1)))
+            log(f"⚠️ Error Shopify request: {e}. Reintentando en {wait_s:.1f}s (intento {attempt}/{SHOPIFY_MAX_RETRIES})")
+            time.sleep(wait_s)
+
+    raise last_err if last_err else RuntimeError("Fallo Shopify desconocido")
+
 def shopify_get(path: str, params: t.Optional[dict] = None) -> dict:
-    r = requests.get(
-        shopify_url(path),
-        headers=shopify_headers(),
-        params=params or {},
-        timeout=REQUEST_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()
+    return _shopify_request("GET", path, params=params)
 
 def shopify_post(path: str, payload: dict) -> dict:
-    r = requests.post(
-        shopify_url(path),
-        headers=shopify_headers(),
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()
+    return _shopify_request("POST", path, json=payload)
 
 def get_fulfilled_orders(limit: int = 50) -> t.List[dict]:
-    """
-    Pedidos con fulfillment_status 'shipped' (los que suelen tener fulfillments con tracking).
-    """
     data = shopify_get(
         "orders.json",
         params={
@@ -128,23 +176,19 @@ def get_fulfilled_orders(limit: int = 50) -> t.List[dict]:
             "order": "created_at desc",
         },
     )
-    return data.get("orders", [])
+    return data.get("orders", []) or []
 
 def get_fulfillment_events(order_id: int, fulfillment_id: int) -> t.List[dict]:
     data = shopify_get(f"orders/{order_id}/fulfillments/{fulfillment_id}/events.json")
     return data.get("fulfillment_events", []) or []
 
 def has_delivered_event(order_id: int, fulfillment_id: int) -> bool:
+    """
+    SOLO esto define el SKIP: si ya hay delivered, no se toca nunca más.
+    """
     events = get_fulfillment_events(order_id, fulfillment_id)
     for e in events:
         if (e.get("status") or "").strip() == "delivered":
-            return True
-    return False
-
-def has_event_status(order_id: int, fulfillment_id: int, status: str) -> bool:
-    events = get_fulfillment_events(order_id, fulfillment_id)
-    for e in events:
-        if (e.get("status") or "").strip() == status:
             return True
     return False
 
@@ -156,23 +200,17 @@ def create_fulfillment_event(
 ) -> bool:
     """
     Crea un fulfillment event en Shopify según mapping del texto CTT.
-    Devuelve True si se creó, False si se omitió o falló.
+    IMPORTANTE: NO hace SKIP por estados repetidos (solo se hace SKIP por delivered en main()).
     """
     mapped = map_ctt_status_to_shopify_event(ctt_status_text)
     if not mapped:
         log(f"ℹ️ {order_id}/{fulfillment_id}: estado CTT ambiguo/no mapeable -> NO se crea evento ({ctt_status_text})")
         return False
 
-    # Idempotencia: no duplicar mismo status
-    if has_event_status(order_id, fulfillment_id, mapped):
-        log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya existe evento '{mapped}'")
-        return False
-
     happened_at = None
     if event_date:
         try:
-            # event_date suele venir en ISO; si viene con Z, normalizamos
-            dt = datetime.fromisoformat(str(event_date).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(event_date.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             happened_at = dt.astimezone(timezone.utc).isoformat()
@@ -191,62 +229,46 @@ def create_fulfillment_event(
     try:
         shopify_post(f"orders/{order_id}/fulfillments/{fulfillment_id}/events.json", payload)
         return True
-    except requests.HTTPError as e:
+    except Exception as e:
         log(f"❌ Error creando fulfillment event {order_id}/{fulfillment_id} ({mapped}): {e}")
         return False
 
 # =========================
-# CTT API
+# CTT API (p_track_redis.php)
 # =========================
 
 def get_ctt_status(tracking_number: str) -> dict:
     """
-    Endpoint real (igual que tu Apps Script):
-      https://wct.cttexpress.com/p_track_redis.php?sc={tracking}
+    Llama al endpoint tipo:
+      https://wct.cttexpress.com/p_track_redis.php?sc=TRACKING
 
-    Devuelve:
-      - status: str (description del último evento)
-      - date: str (event_date del último evento) o None
+    Y extrae:
+      data.data.shipping_history.events[-1].description
+      data.data.shipping_history.events[-1].event_date
     """
     endpoint = CTT_TRACKING_ENDPOINT.format(tracking=tracking_number)
 
-    headers = {"Accept": "application/json"}
-    headers.update(parse_headers_extra(CTT_HEADERS_EXTRA))
-
-    r = requests.get(endpoint, headers=headers, timeout=REQUEST_TIMEOUT)
+    r = requests.get(endpoint, headers={"Accept": "application/json"}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-
     data = r.json()
 
-    # Estructura esperada:
-    # data["data"]["shipping_history"]["events"] -> lista de eventos
-    events = (
-        data.get("data", {})
-            .get("shipping_history", {})
-            .get("events", [])
-    )
+    events = None
+    try:
+        events = data.get("data", {}).get("shipping_history", {}).get("events")
+    except Exception:
+        events = None
 
     if isinstance(events, list) and events:
-        last = events[-1] or {}
-        status = str(last.get("description") or "").strip()
-        date = last.get("event_date") or None
-        return {"status": status or "Estado desconocido", "date": date}
+        last = events[-1]
+        desc = (last.get("description") or "").strip()
+        date = last.get("event_date") or last.get("date") or None
+        return {"status": desc or "Estado desconocido", "date": date}
 
     return {"status": "Sin eventos", "date": None}
 
 # =========================
 # MAPPING CTT -> SHOPIFY
 # =========================
-
-SHOPIFY_EVENT_STATUSES = {
-    "in_transit",
-    "confirmed",
-    "out_for_delivery",
-    "delivered",
-    "failure",
-    "ready_for_pickup",
-    "attempted_delivery",
-}
 
 def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     """
@@ -274,7 +296,7 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     ):
         return "delivered"
 
-    # 2) FAILURE (devoluciones/incidencias graves)
+    # 2) FAILURE
     if has_any(
         "devolucion", "devolucao", "retorno", "retornado",
         "en devolucion", "en devolución", "devuelto", "devolvido",
@@ -286,14 +308,15 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     ):
         return "failure"
 
-    # 3) ATTEMPTED DELIVERY (intento fallido)
+    # 3) ATTEMPTED DELIVERY
     if has_any(
         "intento", "tentativa",
         "ausente", "nao foi possivel entregar", "não foi possível entregar",
         "no se pudo entregar", "no ha sido posible entregar",
         "cliente ausente", "destinatario ausente", "destinatario no disponible",
         "no atendido", "no localizado",
-        "reparto fallido", "fallo en entrega", "entrega fallida"
+        "reparto fallido", "fallo en entrega", "entrega fallida",
+        "incidencia en el reparto", "incidencia reparto"
     ):
         return "attempted_delivery"
 
@@ -301,7 +324,7 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     if has_any(
         "listo para recoger", "listo p/ recoger", "pronto para levantamento",
         "disponible para recogida", "disponivel para recolha",
-        "en punto", "punto de recogida", "ponto de recolha",
+        "punto de recogida", "ponto de recolha",
         "en tienda", "en oficina", "en delegacion", "en delegación",
         "locker", "parcel shop", "pick up", "pickup"
     ):
@@ -311,20 +334,20 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     if has_any(
         "en reparto", "en distribucion", "en distribución",
         "saiu para entrega", "saiu p/ entrega", "em distribuicao", "em distribuição",
-        "out for delivery", "repartidor", "en ruta de entrega", "en ruta",
-        "entrega hoy"
+        "out for delivery", "repartidor", "en ruta de entrega", "en ruta"
     ):
         return "out_for_delivery"
 
-    # 6) CONFIRMED
-    # IMPORTANTE: "Pendiente de recepción en CTT Express" -> normaliza a "pendiente de recepcion ..."
+    # 6) CONFIRMED (aquí metemos Pendiente de recepción)
     if has_any(
-        "pendiente de recepcion",
         "admitido", "admitida",
+        "recogido", "recolhido", "recolhida",
         "aceptado", "aceite", "aceite pela ctt", "aceite pela rede",
-        "registrado", "registado", "recebido", "recebida",
+        "registrado", "registado",
+        "recebido", "recebida",
         "entrada en red", "entrada em rede",
-        "grabado"
+        "pendiente de recepcion",                  # ✅ clave
+        "pendiente de recepcion en ctt express"    # ✅ literal
     ):
         return "confirmed"
 
@@ -332,22 +355,18 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     if has_any(
         "en transito", "en tránsito",
         "em transito", "em trânsito",
-        "en curso", "en proceso",
         "clasificado", "classificado",
         "en plataforma", "hub", "en centro", "en almac", "almacen", "armazem",
         "salida de", "salio de", "saida de", "departed",
-        "llegada a", "chegada a", "arrived",
-        "enviado",
-        "cambio direccion y fecha de entrega", "cambio dirección y fecha de entrega"
+        "llegada a", "chegada a", "arrived"
     ):
         return "in_transit"
 
-    # 8) Ambiguos (NO crear evento)
+    # 8) Ambiguos (si quieres, los mapeamos luego)
     if has_any(
-        "aguardando", "a aguardar", "preaviso", "pre-aviso",
         "informacion recibida", "info recibida",
         "etiqueta creada", "label created",
-        "no enviado"
+        "preaviso", "pre-aviso"
     ):
         return None
 
@@ -374,13 +393,18 @@ def main() -> None:
         for fulfillment in fulfillments:
             fulfillment_id = int(fulfillment["id"])
 
-            # ✅ ÚNICO caso en el que NO se actualiza más:
-            if has_delivered_event(order_id, fulfillment_id):
-                log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya tiene 'delivered' en Shopify.")
+            # ✅ ÚNICO SKIP QUE QUIERES:
+            try:
+                if has_delivered_event(order_id, fulfillment_id):
+                    log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya tiene 'delivered' en Shopify.")
+                    continue
+            except Exception as e:
+                # Si Shopify rate-limitea incluso tras retries, no crasheamos todo:
+                log(f"⚠️ No pude comprobar delivered para {order_id}/{fulfillment_id}: {e}")
+                # seguimos procesando el siguiente fulfillment para no matar el run
                 continue
 
             tracking_numbers: t.List[str] = []
-
             if fulfillment.get("tracking_numbers"):
                 tracking_numbers = [tn for tn in fulfillment["tracking_numbers"] if tn]
             elif fulfillment.get("tracking_number"):
@@ -407,6 +431,7 @@ def main() -> None:
                     log(f"ℹ️ {order_id}/{fulfillment_id} ({tn}): {ctt_status or 'Sin estado'}")
                     continue
 
+                # Si el texto trae "error" literal, lo tratamos como fallo de consulta
                 if "error" in normalize_text(ctt_status):
                     log(f"⚠️ Error con CTT para {order_id}/{fulfillment_id} ({tn}): {ctt_status}")
                     continue
