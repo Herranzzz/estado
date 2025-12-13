@@ -345,7 +345,8 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
         "entrada en red", "entrada em rede",
 
         # ✅ AÑADIDO: “Pendiente de recepción en CTT Express”
-        "Pendiente de recepción en CTT Express"
+        "pendiente de recepcion"
+
     ):
         return "confirmed"
 
