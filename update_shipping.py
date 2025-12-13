@@ -345,4 +345,82 @@ def map_ctt_status_to_shopify_event(ctt_status_text: str) -> t.Optional[str]:
     # 8) Ambiguos (NO crear evento)
     if has_any(
         "aguardando", "a aguardar", "preaviso", "pre-aviso",
-        "informacion recibida", "info recibi
+        "informacion recibida", "info recibida",
+        "etiqueta creada", "label created",
+        "no enviado"
+    ):
+        return None
+
+    return None
+
+# =========================
+# MAIN
+# =========================
+
+def main() -> None:
+    if not require_env():
+        return
+
+    orders = get_fulfilled_orders(limit=ORDERS_LIMIT)
+    log(f"📦 Procesando {len(orders)} pedidos...")
+
+    for order in orders:
+        fulfillments = order.get("fulfillments", []) or []
+        if not fulfillments:
+            continue
+
+        order_id = int(order["id"])
+
+        for fulfillment in fulfillments:
+            fulfillment_id = int(fulfillment["id"])
+
+            # ✅ ÚNICO caso en el que NO se actualiza más:
+            if has_delivered_event(order_id, fulfillment_id):
+                log(f"⏭️ SKIP {order_id}/{fulfillment_id}: ya tiene 'delivered' en Shopify.")
+                continue
+
+            tracking_numbers: t.List[str] = []
+
+            if fulfillment.get("tracking_numbers"):
+                tracking_numbers = [tn for tn in fulfillment["tracking_numbers"] if tn]
+            elif fulfillment.get("tracking_number"):
+                tracking_numbers = [fulfillment["tracking_number"]]
+
+            if not tracking_numbers:
+                log(f"⚠️ Pedido {order_id}/{fulfillment_id} sin número de seguimiento")
+                continue
+
+            for tn in tracking_numbers:
+                try:
+                    ctt_result = get_ctt_status(tn)
+                except requests.HTTPError as e:
+                    log(f"⚠️ Error HTTP CTT para {order_id}/{fulfillment_id} ({tn}): {e}")
+                    continue
+                except Exception as e:
+                    log(f"⚠️ Error CTT para {order_id}/{fulfillment_id} ({tn}): {e}")
+                    continue
+
+                ctt_status = (ctt_result.get("status") or "").strip()
+                ctt_date = ctt_result.get("date")
+
+                if not ctt_status or ctt_status in ("Sin eventos", "Estado desconocido"):
+                    log(f"ℹ️ {order_id}/{fulfillment_id} ({tn}): {ctt_status or 'Sin estado'}")
+                    continue
+
+                if "error" in normalize_text(ctt_status):
+                    log(f"⚠️ Error con CTT para {order_id}/{fulfillment_id} ({tn}): {ctt_status}")
+                    continue
+
+                success = create_fulfillment_event(
+                    order_id,
+                    fulfillment_id,
+                    ctt_status,
+                    event_date=ctt_date,
+                )
+
+                if success:
+                    mapped_status = map_ctt_status_to_shopify_event(ctt_status)
+                    log(f"🚚 Actualizado {order_id}/{fulfillment_id} ({tn}): {ctt_status} -> {mapped_status}")
+
+if __name__ == "__main__":
+    main()
