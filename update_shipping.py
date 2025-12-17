@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime
 from dateutil.parser import parse
@@ -19,6 +20,20 @@ TZ_NAME = os.getenv("TZ_NAME", "Europe/Madrid")
 
 # Archivo de log
 LOG_FILE = "logs_actualizacion_envios.txt"
+
+# =========================
+# HTTP SESSION (mejor para evitar bloqueos / respuestas raras)
+# =========================
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 (compatible; DondeFueBot/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+)
 
 
 def log(message: str):
@@ -67,24 +82,55 @@ def get_fulfilled_orders(limit=300):
 
 
 def get_ctt_status(tracking_number: str):
-    """Consulta el estado actual desde la API de CTT y devuelve estado + fecha real."""
-    r = requests.get(CTT_API_URL + tracking_number, timeout=30)
-    if r.status_code != 200:
-        return {"status": "CTT API error", "date": None}
+    """
+    Consulta el estado actual desde CTT y devuelve {"status": str, "date": str|None}.
+    Robusto contra respuestas no-JSON (HTML, vacío, errores, rate-limit).
+    """
+    url = CTT_API_URL + str(tracking_number)
 
-    data = r.json()
-    if data.get("error") is not None:
-        return {"status": "Error en API CTT", "date": None}
+    # Reintentos rápidos por si CTT falla intermitente
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = SESSION.get(url, timeout=30, allow_redirects=True)
 
-    events = data.get("data", {}).get("shipping_history", {}).get("events", [])
-    if not events:
-        return {"status": "Sin eventos", "date": None}
+            if r.status_code != 200:
+                snippet = (r.text or "")[:220].replace("\n", " ")
+                log(f"⚠️ CTT {tracking_number}: HTTP {r.status_code}. Body(220)={snippet!r}")
+                return {"status": "CTT API error", "date": None}
 
-    last_event = events[-1]
-    return {
-        "status": last_event.get("description", "Estado desconocido"),
-        "date": last_event.get("event_date"),  # Fecha real del evento (string)
-    }
+            text = (r.text or "").strip()
+            if not text:
+                log(f"⚠️ CTT {tracking_number}: respuesta vacía")
+                return {"status": "CTT respuesta vacía", "date": None}
+
+            try:
+                data = r.json()
+            except Exception:
+                snippet = text[:220].replace("\n", " ")
+                log(f"⚠️ CTT {tracking_number}: no JSON. Body(220)={snippet!r}")
+                return {"status": "CTT no JSON", "date": None}
+
+            if data.get("error") is not None:
+                return {"status": "Error en API CTT", "date": None}
+
+            events = data.get("data", {}).get("shipping_history", {}).get("events", [])
+            if not events:
+                return {"status": "Sin eventos", "date": None}
+
+            last_event = events[-1]
+            return {
+                "status": last_event.get("description", "Estado desconocido"),
+                "date": last_event.get("event_date"),
+            }
+
+        except requests.RequestException as e:
+            last_err = e
+            log(f"⚠️ CTT {tracking_number}: error de red intento {attempt}/3: {e}")
+            time.sleep(1.2 * attempt)
+
+    log(f"❌ CTT {tracking_number}: fallo tras reintentos: {last_err}")
+    return {"status": "CTT error red", "date": None}
 
 
 def map_ctt_to_shopify(status: str):
@@ -132,13 +178,14 @@ def fulfillment_has_status(events: list, status: str) -> bool:
 
 
 def get_last_event_info(events: list):
-    """Devuelve (last_status, last_created_at_dt_utc_or_naive) del último evento."""
+    """Devuelve (last_status, last_created_at_dt) del último evento."""
     if not events:
         return None, None
     last_event = events[-1]
     last_status = last_event.get("status")
     created_at = last_event.get("created_at")
-    return last_status, parse(created_at) if created_at else (last_status, None)
+    # FIX: evitar tupla anidada por precedencia
+    return (last_status, parse(created_at)) if created_at else (last_status, None)
 
 
 def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str, ctt_event_date_str: str | None):
@@ -154,14 +201,13 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
     event_status = map_ctt_to_shopify(ctt_status)
     ctt_dt = parse_ctt_datetime(ctt_event_date_str, tz)
 
-    # Si no hay fecha, no actualizamos (para cumplir tu regla "solo si coincide con hoy")
+    # Si no hay fecha, no actualizamos
     if ctt_dt is None:
         log(f"⏭️ SKIP {order_id}: CTT sin fecha de evento (no actualizo nada)")
         return
 
     # Regla: solo si CTT es de HOY
     if ctt_dt.date() != today_local:
-        # Caso extra: si fuera delivered antiguo, lo bloqueamos sí o sí
         if event_status == "delivered":
             log(f"⏭️ SKIP {order_id}: CTT='Entregado' pero fecha {ctt_dt.date()} != hoy {today_local}")
         else:
@@ -178,10 +224,9 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
 
     last_status, last_date = get_last_event_info(events)
 
-    # Si el último estado es el mismo, evitamos duplicar (comparando fecha)
+    # Si el último estado es el mismo, evitamos duplicar
     if last_status == event_status:
         if last_date:
-            # last_date puede venir con tz o no; lo llevamos a tz para comparar por día
             if last_date.tzinfo is None:
                 last_local = last_date.replace(tzinfo=tz)
             else:
@@ -200,7 +245,6 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
         "event": {
             "status": event_status,
             "message": f"Estado CTT: {ctt_status}",
-            # Guardamos created_at igual al evento real (normalizado a tz)
             "created_at": ctt_dt.isoformat(),
         }
     }
@@ -235,8 +279,15 @@ def main():
 
         # Estado actual y fecha en CTT
         ctt_result = get_ctt_status(tracking_number)
-        ctt_status = ctt_result["status"]
-        ctt_date = ctt_result["date"]
+        ctt_status = ctt_result.get("status")
+        ctt_date = ctt_result.get("date")
+
+        # Pequeño throttle para no provocar respuestas raras / rate-limit
+        time.sleep(0.15)
+
+        if not ctt_status:
+            log(f"⏭️ SKIP {order_id}: CTT sin status (tracking {tracking_number})")
+            continue
 
         if "error" in (ctt_status or "").lower():
             log(f"⚠️ Error con CTT para {order_id}: {ctt_status}")
