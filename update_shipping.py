@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import requests
 from datetime import datetime
 from dateutil.parser import parse
@@ -9,7 +10,8 @@ from zoneinfo import ZoneInfo
 # CONFIG
 # =========================
 # Shopify API
-SHOP_URL = "https://48d471-2.myshopify.com"
+SHOP_URL = os.getenv("SHOP_URL", "https://48d471-2.myshopify.com")
+API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2023-10")
 ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
 # CTT API
@@ -18,14 +20,23 @@ CTT_API_URL = "https://wct.cttexpress.com/p_track_redis.php?sc="
 # Zona horaria para comparar "hoy"
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Madrid")
 
-# Archivo de log
-LOG_FILE = "logs_actualizacion_envios.txt"
+# Logs
+LOG_FILE = os.getenv("LOG_FILE", "logs_actualizacion_envios.txt")
+
+# Límites / resiliencia CTT
+CTT_MAX_RETRIES = int(os.getenv("CTT_MAX_RETRIES", "6"))
+CTT_BASE_BACKOFF = float(os.getenv("CTT_BASE_BACKOFF", "0.7"))  # segundos
+CTT_MAX_BACKOFF = float(os.getenv("CTT_MAX_BACKOFF", "25"))     # segundos
+CTT_THROTTLE_SECONDS = float(os.getenv("CTT_THROTTLE_SECONDS", "0.8"))  # delay entre requests a CTT
+
+# Shopify (timeouts)
+SHOPIFY_TIMEOUT = float(os.getenv("SHOPIFY_TIMEOUT", "30"))
 
 # =========================
-# HTTP SESSION (mejor para evitar bloqueos / respuestas raras)
+# HTTP SESSIONS
 # =========================
-SESSION = requests.Session()
-SESSION.headers.update(
+CTT_SESSION = requests.Session()
+CTT_SESSION.headers.update(
     {
         "User-Agent": "Mozilla/5.0 (compatible; DondeFueBot/1.0)",
         "Accept": "application/json,text/plain,*/*",
@@ -35,25 +46,34 @@ SESSION.headers.update(
     }
 )
 
+SHOP_SESSION = requests.Session()
+# (Shopify rate limit se gestiona bastante bien con paginación + pocas llamadas,
+# pero dejamos sesión para keep-alive)
+SHOP_SESSION.headers.update({"Content-Type": "application/json"})
+
 
 def log(message: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
     print(message)
 
 
 def shopify_headers():
-    return {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
+    return {"X-Shopify-Access-Token": ACCESS_TOKEN, "Content-Type": "application/json"}
+
+
+def safe_snippet(text: str, n: int = 220) -> str:
+    return (text or "")[:n].replace("\n", " ").replace("\r", " ")
 
 
 def get_fulfilled_orders(limit=500):
     """Obtiene hasta 'limit' pedidos con fulfillment completado."""
     all_orders = []
-    url = f"{SHOP_URL}/admin/api/2023-10/orders.json"
+    url = f"{SHOP_URL}/admin/api/{API_VERSION}/orders.json"
     params = {
         "fulfillment_status": "fulfilled",
         "status": "any",
@@ -62,7 +82,7 @@ def get_fulfilled_orders(limit=500):
     }
 
     while len(all_orders) < limit:
-        r = requests.get(url, headers=shopify_headers(), params=params, timeout=30)
+        r = SHOP_SESSION.get(url, headers=shopify_headers(), params=params, timeout=SHOPIFY_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         orders = data.get("orders", [])
@@ -71,7 +91,7 @@ def get_fulfilled_orders(limit=500):
 
         all_orders.extend(orders)
 
-        # Siguiente página si existe
+        # Paginación (Link header)
         if "Link" in r.headers and 'rel="next"' in r.headers["Link"]:
             url = r.links["next"]["url"]
             params = None
@@ -81,34 +101,82 @@ def get_fulfilled_orders(limit=500):
     return all_orders[:limit]
 
 
+def parse_ctt_datetime(event_date_str: str | None, tz: ZoneInfo):
+    """Parsea la fecha de CTT y la normaliza a tz. Si viene sin tz, asumimos tz."""
+    if not event_date_str:
+        return None
+    dt = parse(event_date_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    else:
+        dt = dt.astimezone(tz)
+    return dt
+
+
+def map_ctt_to_shopify(status: str):
+    """Mapea el estado devuelto por CTT al formato de Shopify."""
+    status_map = {
+        "En reparto": "out_for_delivery",
+        "Entrega hoy": "out_for_delivery",
+        "Entregado": "delivered",
+        "En tránsito": "in_transit",
+        "En transito": "in_transit",
+        "Recogido": "in_transit",
+        "Pendiente de recepción en CTT Express": "confirmed",
+        "Reparto fallido": "failure",
+    }
+    return status_map.get(status, "in_transit")
+
+
 def get_ctt_status(tracking_number: str):
     """
-    Consulta el estado actual desde CTT y devuelve {"status": str, "date": str|None}.
-    Robusto contra respuestas no-JSON (HTML, vacío, errores, rate-limit).
+    Consulta el estado desde CTT y devuelve {"status": str, "date": str|None}.
+    Robusto contra respuestas no-JSON, vacías, y 429 (retry con backoff).
     """
     url = CTT_API_URL + str(tracking_number)
-
-    # Reintentos rápidos por si CTT falla intermitente
     last_err = None
-    for attempt in range(1, 4):
-        try:
-            r = SESSION.get(url, timeout=30, allow_redirects=True)
 
+    for attempt in range(1, CTT_MAX_RETRIES + 1):
+        try:
+            r = CTT_SESSION.get(url, timeout=30, allow_redirects=True)
+
+            # Rate limit: 429 => backoff + retry
+            if r.status_code == 429:
+                wait = min(CTT_BASE_BACKOFF * (2 ** (attempt - 1)), CTT_MAX_BACKOFF)
+                wait = wait * (0.85 + random.random() * 0.5)  # jitter 0.85–1.35
+                log(f"⏳ CTT {tracking_number}: 429 Too Many Requests. Reintento {attempt}/{CTT_MAX_RETRIES} en {wait:.2f}s")
+                time.sleep(wait)
+                continue
+
+            # Errores HTTP != 200: no tiene sentido reintentar mucho (salvo 5xx)
             if r.status_code != 200:
-                snippet = (r.text or "")[:220].replace("\n", " ")
+                snippet = safe_snippet(r.text)
                 log(f"⚠️ CTT {tracking_number}: HTTP {r.status_code}. Body(220)={snippet!r}")
+                # 5xx a veces merece retry
+                if 500 <= r.status_code < 600 and attempt < CTT_MAX_RETRIES:
+                    wait = min(CTT_BASE_BACKOFF * (2 ** (attempt - 1)), CTT_MAX_BACKOFF)
+                    time.sleep(wait)
+                    continue
                 return {"status": "CTT API error", "date": None}
 
             text = (r.text or "").strip()
             if not text:
-                log(f"⚠️ CTT {tracking_number}: respuesta vacía")
+                # vacío: puede ser intermitente; reintenta un poco
+                log(f"⚠️ CTT {tracking_number}: respuesta vacía (intento {attempt}/{CTT_MAX_RETRIES})")
+                if attempt < CTT_MAX_RETRIES:
+                    time.sleep(CTT_BASE_BACKOFF * attempt)
+                    continue
                 return {"status": "CTT respuesta vacía", "date": None}
 
             try:
                 data = r.json()
             except Exception:
-                snippet = text[:220].replace("\n", " ")
+                snippet = safe_snippet(text)
                 log(f"⚠️ CTT {tracking_number}: no JSON. Body(220)={snippet!r}")
+                # a veces llega HTML temporal; reintenta un poco
+                if attempt < CTT_MAX_RETRIES:
+                    time.sleep(CTT_BASE_BACKOFF * attempt)
+                    continue
                 return {"status": "CTT no JSON", "date": None}
 
             if data.get("error") is not None:
@@ -126,74 +194,40 @@ def get_ctt_status(tracking_number: str):
 
         except requests.RequestException as e:
             last_err = e
-            log(f"⚠️ CTT {tracking_number}: error de red intento {attempt}/3: {e}")
-            time.sleep(1.2 * attempt)
+            wait = min(CTT_BASE_BACKOFF * (2 ** (attempt - 1)), CTT_MAX_BACKOFF)
+            wait = wait * (0.85 + random.random() * 0.5)
+            log(f"⚠️ CTT {tracking_number}: error de red {attempt}/{CTT_MAX_RETRIES}: {e}. Espero {wait:.2f}s")
+            time.sleep(wait)
 
     log(f"❌ CTT {tracking_number}: fallo tras reintentos: {last_err}")
     return {"status": "CTT error red", "date": None}
 
 
-def map_ctt_to_shopify(status: str):
-    """Mapea el estado devuelto por CTT al formato de Shopify."""
-    status_map = {
-        "En reparto": "out_for_delivery",
-        "Entrega hoy": "out_for_delivery",
-        "Entregado": "delivered",
-        "En tránsito": "in_transit",
-        "Recogido": "in_transit",
-        "Pendiente de recepción en CTT Express": "confirmed",
-        "Reparto fallido": "failure",
-    }
-    return status_map.get(status, "in_transit")
-
-
-def parse_ctt_datetime(event_date_str: str | None, tz: ZoneInfo):
-    """Parsea la fecha de CTT y la normaliza a tz. Si viene sin tz, asumimos tz."""
-    if not event_date_str:
-        return None
-    dt = parse(event_date_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    else:
-        dt = dt.astimezone(tz)
-    return dt
-
-
 def get_fulfillment_events(order_id: int, fulfillment_id: int):
     """Devuelve lista de eventos del fulfillment (Shopify)."""
-    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
-    r = requests.get(url, headers=shopify_headers(), timeout=30)
+    url = f"{SHOP_URL}/admin/api/{API_VERSION}/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    r = SHOP_SESSION.get(url, headers=shopify_headers(), timeout=SHOPIFY_TIMEOUT)
     if r.status_code != 200:
-        log(f"❌ No se pudo obtener eventos para {order_id}/{fulfillment_id}: {r.status_code} - {r.text}")
+        log(f"❌ No se pudo obtener eventos para {order_id}/{fulfillment_id}: {r.status_code} - {safe_snippet(r.text, 300)}")
         return []
     return r.json().get("events", []) or []
 
 
-def fulfillment_has_status(events: list, status: str) -> bool:
-    """True si hay algún evento con ese status en Shopify."""
+def fulfillment_has_status_anywhere(events: list, status: str) -> bool:
+    """True si existe ese status en cualquier evento del fulfillment."""
     for ev in events:
         if ev.get("status") == status:
             return True
     return False
 
 
-def get_last_event_info(events: list):
-    """Devuelve (last_status, last_created_at_dt) del último evento."""
-    if not events:
-        return None, None
-    last_event = events[-1]
-    last_status = last_event.get("status")
-    created_at = last_event.get("created_at")
-    # FIX: evitar tupla anidada por precedencia
-    return (last_status, parse(created_at)) if created_at else (last_status, None)
-
-
 def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str, ctt_event_date_str: str | None):
     """
-    Crea un nuevo evento en Shopify con dos reglas:
-    - Si Shopify ya tiene delivered -> NO hace nada.
-    - Solo crea eventos si la fecha de CTT es "hoy" (TZ_NAME).
-      Y especialmente: si CTT dice Entregado pero no es hoy -> no crea delivered.
+    Reglas:
+    - Si Shopify ya tiene 'delivered' => NO hace nada (candado fuerte).
+    - SOLO crea eventos si la fecha del último evento CTT es HOY (TZ_NAME).
+    - Idempotencia TOTAL por estado: si Shopify ya tuvo ese 'status' alguna vez => NO lo repite.
+      (Evita notificaciones duplicadas.)
     """
     tz = ZoneInfo(TZ_NAME)
     today_local = datetime.now(tz).date()
@@ -206,7 +240,7 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
         log(f"⏭️ SKIP {order_id}: CTT sin fecha de evento (no actualizo nada)")
         return
 
-    # Regla: solo si CTT es de HOY
+    # Solo si es HOY
     if ctt_dt.date() != today_local:
         if event_status == "delivered":
             log(f"⏭️ SKIP {order_id}: CTT='Entregado' pero fecha {ctt_dt.date()} != hoy {today_local}")
@@ -214,33 +248,21 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
             log(f"⏭️ SKIP {order_id}: CTT fecha {ctt_dt.date()} != hoy {today_local} (no actualizo)")
         return
 
-    # Traemos eventos 1 vez y aplicamos candados
+    # Traemos eventos una sola vez
     events = get_fulfillment_events(order_id, fulfillment_id)
 
-    # Candado fuerte: si ya hay delivered en Shopify, no vuelvas a tocar nada
-    if fulfillment_has_status(events, "delivered"):
-        log(f"⏭️ SKIP {order_id}: ya tiene 'delivered' en Shopify (idempotente)")
+    # Candado fuerte: si ya hay delivered, no tocar
+    if fulfillment_has_status_anywhere(events, "delivered"):
+        log(f"⏭️ SKIP {order_id}: ya tiene 'delivered' en Shopify (idempotente total)")
         return
 
-    last_status, last_date = get_last_event_info(events)
-
-    # Si el último estado es el mismo, evitamos duplicar
-    if last_status == event_status:
-        if last_date:
-            if last_date.tzinfo is None:
-                last_local = last_date.replace(tzinfo=tz)
-            else:
-                last_local = last_date.astimezone(tz)
-
-            if last_local.date() >= ctt_dt.date():
-                log(f"🔒 Pedido {order_id} ya tiene '{event_status}' actualizado para esa fecha, no se crea evento")
-                return
-
-        log(f"ℹ️ Estado sin cambios para pedido {order_id} ({event_status})")
+    # Idempotencia total por estado: si ya se creó ese status alguna vez, no repetir
+    if fulfillment_has_status_anywhere(events, event_status):
+        log(f"⏭️ SKIP {order_id}: ya tuvo '{event_status}' en Shopify (no duplico notificación)")
         return
 
     # Crear evento
-    url = f"{SHOP_URL}/admin/api/2023-10/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
+    url = f"{SHOP_URL}/admin/api/{API_VERSION}/orders/{order_id}/fulfillments/{fulfillment_id}/events.json"
     payload = {
         "event": {
             "status": event_status,
@@ -249,11 +271,11 @@ def create_fulfillment_event(order_id: int, fulfillment_id: int, ctt_status: str
         }
     }
 
-    r = requests.post(url, headers=shopify_headers(), json=payload, timeout=30)
+    r = SHOP_SESSION.post(url, headers=shopify_headers(), json=payload, timeout=SHOPIFY_TIMEOUT)
     if r.status_code == 201:
         log(f"✅ Evento '{event_status}' añadido a pedido {order_id} (CTT: {ctt_status}, fecha: {ctt_dt.date()})")
     else:
-        log(f"❌ Error al añadir evento en pedido {order_id}: {r.status_code} - {r.text}")
+        log(f"❌ Error al añadir evento en pedido {order_id}: {r.status_code} - {safe_snippet(r.text, 300)}")
 
 
 def main():
@@ -282,8 +304,8 @@ def main():
         ctt_status = ctt_result.get("status")
         ctt_date = ctt_result.get("date")
 
-        # Pequeño throttle para no provocar respuestas raras / rate-limit
-        time.sleep(0.15)
+        # Throttle fijo para no provocar rate-limit
+        time.sleep(CTT_THROTTLE_SECONDS)
 
         if not ctt_status:
             log(f"⏭️ SKIP {order_id}: CTT sin status (tracking {tracking_number})")
