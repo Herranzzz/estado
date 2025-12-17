@@ -50,7 +50,7 @@ def shopify_headers():
     }
 
 
-def get_fulfilled_orders(limit=300):
+def get_fulfilled_orders(limit=500):
     """Obtiene hasta 'limit' pedidos con fulfillment completado."""
     all_orders = []
     url = f"{SHOP_URL}/admin/api/2023-10/orders.json"
