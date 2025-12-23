@@ -20,6 +20,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Restaura la carpeta .state (SQLite + estado) de ejecuciones anteriores
+      - name: Restaurar estado (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ runner.os }}-
+
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
@@ -29,5 +38,19 @@ jobs:
           SHOP_URL: "https://dondefue.myshopify.com"
           SHOPIFY_API_VERSION: "2023-10"
           TZ_NAME: "Europe/Madrid"
-          ORDERS_LIMIT: "250"
+          MAX_SHOPIFY_ORDERS: "250"   # <-- antes tenías ORDERS_LIMIT
+          STATE_DIR: ".state"
         run: python update_shipping.py
+
+      # Evita el warning si el script falla antes de crear .state
+      - name: Asegurar carpeta de estado
+        if: always()
+        run: mkdir -p .state
+
+      # Guarda el estado al final (aunque falle el job)
+      - name: Guardar estado (cache)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ runner.os }}-${{ github.run_id }}
