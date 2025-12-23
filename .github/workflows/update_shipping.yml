@@ -11,16 +11,12 @@ on:
 jobs:
   update-shipping-status:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Clonar repositorio (con reintentos)
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 1
-          lfs: false
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -29,7 +25,9 @@ jobs:
 
       - name: Ejecutar script
         env:
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}  # este sí debe ser secreto
-          SHOPIFY_STORE_DOMAIN: "dondefue.myshopify.com"             # este NO hace falta ocultarlo
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOP_URL: "https://dondefue.myshopify.com"
+          SHOPIFY_API_VERSION: "2023-10"
+          TZ_NAME: "Europe/Madrid"
           ORDERS_LIMIT: "250"
         run: python update_shipping.py
