@@ -25,9 +25,9 @@ LOG_FILE = os.getenv("LOG_FILE", "logs_actualizacion_envios.txt")
 MAX_SHOPIFY_ORDERS = int(os.getenv("MAX_SHOPIFY_ORDERS", "500"))
 
 # Incidencias
-INCIDENT_AFTER_DAYS = int(os.getenv("INCIDENT_AFTER_DAYS", "4"))     # >4 días desde envío => incidencia
+INCIDENT_AFTER_DAYS = int(os.getenv("INCIDENT_AFTER_DAYS", "4"))        # >4 días desde envío => incidencia
 INCIDENT_RECHECK_HOURS = int(os.getenv("INCIDENT_RECHECK_HOURS", "24"))  # incidencias se revisan cada 24h
-INCIDENT_STATUS = os.getenv("INCIDENT_STATUS", "failure")  # evento Shopify para incidencia
+INCIDENT_STATUS = os.getenv("INCIDENT_STATUS", "failure")               # evento Shopify para incidencia
 
 # Revisión normal (no-incidencia): 0 = cada ejecución
 NORMAL_RECHECK_MINUTES = int(os.getenv("NORMAL_RECHECK_MINUTES", "0"))
@@ -331,12 +331,17 @@ def db_set_incident(conn: sqlite3.Connection, order_id: int, fulfillment_id: int
     conn.commit()
 
 
-def db_update_check(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, *,
-                    ctt_status: str | None,
-                    ctt_event_at: str | None,
-                    shopify_status: str | None,
-                    next_check_at: str | None,
-                    last_error: str | None):
+def db_update_check(
+    conn: sqlite3.Connection,
+    order_id: int,
+    fulfillment_id: int,
+    *,
+    ctt_status: str | None,
+    ctt_event_at: str | None,
+    shopify_status: str | None,
+    next_check_at: str | None,
+    last_error: str | None,
+):
     now_iso = datetime.now(TZ).isoformat()
     conn.execute(
         """
@@ -399,8 +404,15 @@ def discover_shipments_from_shopify(conn: sqlite3.Connection):
     log(f"🧠 Descubiertos/actualizados {total_f} fulfillments desde Shopify (MAX_SHOPIFY_ORDERS={MAX_SHOPIFY_ORDERS})")
 
 
-def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tracking_number: str,
-                shipped_at_str: str | None, is_incident: int, last_shopify_status: str | None):
+def process_one(
+    conn: sqlite3.Connection,
+    order_id: int,
+    fulfillment_id: int,
+    tracking_number: str,
+    shipped_at_str: str | None,
+    is_incident: int,
+    last_shopify_status: str | None,
+):
     now = datetime.now(TZ)
 
     # 1) Si Shopify ya tiene delivered, cerramos para siempre (candado fuerte + DB)
@@ -431,16 +443,20 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
             db_mark_delivered(conn, order_id, fulfillment_id, delivered_at_iso=ctt_dt.isoformat())
             log(f"✅ {order_id}/{fulfillment_id} ya estaba delivered en Shopify. Cierro seguimiento.")
             db_update_check(
-                conn, order_id, fulfillment_id,
-                ctt_status=ctt_status, ctt_event_at=ctt_dt.isoformat(),
+                conn,
+                order_id,
+                fulfillment_id,
+                ctt_status=ctt_status,
+                ctt_event_at=ctt_dt.isoformat(),
                 shopify_status="delivered",
                 next_check_at=None,
-                last_error=None
+                last_error=None,
             )
             return
 
         ok, err = create_shopify_event(
-            order_id, fulfillment_id,
+            order_id,
+            fulfillment_id,
             status="delivered",
             message=f"Estado CTT: {ctt_status}",
             created_at_iso=ctt_dt.isoformat(),
@@ -449,22 +465,28 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
             db_mark_delivered(conn, order_id, fulfillment_id, delivered_at_iso=ctt_dt.isoformat())
             log(f"✅ DELIVERED {order_id}/{fulfillment_id} (tracking {tracking_number})")
             db_update_check(
-                conn, order_id, fulfillment_id,
-                ctt_status=ctt_status, ctt_event_at=ctt_dt.isoformat(),
+                conn,
+                order_id,
+                fulfillment_id,
+                ctt_status=ctt_status,
+                ctt_event_at=ctt_dt.isoformat(),
                 shopify_status="delivered",
                 next_check_at=None,
-                last_error=None
+                last_error=None,
             )
         else:
             log(f"❌ Error creando DELIVERED {order_id}/{fulfillment_id}: {err}")
             # Reintento pronto
             next_check = (now + timedelta(minutes=10)).isoformat()
             db_update_check(
-                conn, order_id, fulfillment_id,
-                ctt_status=ctt_status, ctt_event_at=ctt_dt.isoformat(),
+                conn,
+                order_id,
+                fulfillment_id,
+                ctt_status=ctt_status,
+                ctt_event_at=ctt_dt.isoformat(),
                 shopify_status=last_shopify_status,
                 next_check_at=next_check,
-                last_error=err
+                last_error=err,
             )
         return
 
@@ -474,11 +496,14 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
         db_mark_delivered(conn, order_id, fulfillment_id, delivered_at_iso=None)
         log(f"✅ {order_id}/{fulfillment_id} detectado delivered en Shopify. Cierro seguimiento.")
         db_update_check(
-            conn, order_id, fulfillment_id,
-            ctt_status=ctt_status, ctt_event_at=ctt_dt.isoformat(),
+            conn,
+            order_id,
+            fulfillment_id,
+            ctt_status=ctt_status,
+            ctt_event_at=ctt_dt.isoformat(),
             shopify_status="delivered",
             next_check_at=None,
-            last_error=None
+            last_error=None,
         )
         return
 
@@ -493,7 +518,8 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
                 log(f"⏭️ {order_id}/{fulfillment_id} status '{mapped_status}' ya existe en Shopify (no duplico).")
             else:
                 ok, err = create_shopify_event(
-                    order_id, fulfillment_id,
+                    order_id,
+                    fulfillment_id,
                     status=mapped_status,
                     message=f"Estado CTT: {ctt_status}",
                     created_at_iso=ctt_dt.isoformat(),
@@ -508,7 +534,7 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
             # mismo estado que la última vez => no tocamos
             pass
 
-    # 7) Incidencia (>4 días) — se marca 1 sola vez, y luego solo se re-chequea cada 24h
+    # 7) Incidencia (>X días) — se marca 1 sola vez, y luego solo se re-chequea cada 24h
     if should_incident:
         if not is_incident:
             # crear evento de incidencia una vez
@@ -517,7 +543,8 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
                 db_set_incident(conn, order_id, fulfillment_id, marked_at_iso=now.isoformat())
             else:
                 ok, err = create_shopify_event(
-                    order_id, fulfillment_id,
+                    order_id,
+                    fulfillment_id,
                     status=INCIDENT_STATUS,
                     message=f"Incidencia: +{INCIDENT_AFTER_DAYS} días sin entregar desde envío",
                     created_at_iso=now.isoformat(),
@@ -539,12 +566,14 @@ def process_one(conn: sqlite3.Connection, order_id: int, fulfillment_id: int, tr
             next_check = (now + timedelta(minutes=NORMAL_RECHECK_MINUTES)).isoformat()
 
     db_update_check(
-        conn, order_id, fulfillment_id,
+        conn,
+        order_id,
+        fulfillment_id,
         ctt_status=ctt_status,
         ctt_event_at=ctt_dt.isoformat() if ctt_dt else None,
         shopify_status=posted_status,
         next_check_at=next_check,
-        last_error=error_msg
+        last_error=error_msg,
     )
 
 
@@ -568,7 +597,15 @@ def main():
     pending = db_get_pending(conn, limit=3000)
     log(f"🔄 Pendientes a revisar (no entregados): {len(pending)}")
 
-    for (order_id, fulfillment_id, tracking_number, shipped_at, is_incident, last_shopify_status, next_check_at) in pending:
+    for (
+        order_id,
+        fulfillment_id,
+        tracking_number,
+        shipped_at,
+        is_incident,
+        last_shopify_status,
+        next_check_at,
+    ) in pending:
         if not tracking_number:
             continue
         try:
@@ -586,11 +623,14 @@ def main():
             # reintento en 30 min
             retry_at = (datetime.now(TZ) + timedelta(minutes=30)).isoformat()
             db_update_check(
-                conn, int(order_id), int(fulfillment_id),
-                ctt_status=None, ctt_event_at=None,
+                conn,
+                int(order_id),
+                int(fulfillment_id),
+                ctt_status=None,
+                ctt_event_at=None,
                 shopify_status=last_shopify_status,
                 next_check_at=retry_at,
-                last_error=str(e)
+                last_error=str(e),
             )
 
     conn.close()
