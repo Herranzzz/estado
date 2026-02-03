@@ -24,27 +24,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ✅ Construye SHOP_URL de forma segura (si tienes SHOPIFY_SHOP)
+      - name: Build SHOP_URL
+        shell: bash
+        env:
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}  # ej: dondefue.myshopify.com
+          SHOP_URL_SECRET: ${{ secrets.SHOP_URL }}   # (opcional) ej: https://dondefue.myshopify.com
+        run: |
+          set -euo pipefail
+          if [[ -n "${SHOP_URL_SECRET:-}" ]]; then
+            echo "SHOP_URL=${SHOP_URL_SECRET%/}" >> $GITHUB_ENV
+          elif [[ -n "${SHOPIFY_SHOP:-}" ]]; then
+            SHOP="${SHOPIFY_SHOP#https://}"
+            SHOP="${SHOP#http://}"
+            echo "SHOP_URL=https://${SHOP%/}" >> $GITHUB_ENV
+          else
+            echo "ERROR: Falta secrets.SHOPIFY_SHOP o secrets.SHOP_URL" >&2
+            exit 1
+          fi
+
       - name: Run updater
         env:
           # Shopify (compat con tu script)
-          SHOP_URL: ${{ secrets.SHOPIFY_SHOP_URL }}          # ej: https://dondefue.myshopify.com
+          SHOP_URL: ${{ env.SHOP_URL }}
           SHOPIFY_API_VERSION: "2024-04"
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
 
-          # (Opcional) por si tu script también mira estas keys en algún punto
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}          # ej: dondefue.myshopify.com
-          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
-
-          # CTT
+          # CTT (déjalos si tu script los usa; si no, puedes borrarlos)
           CTT_TRACKING_ENDPOINT: ${{ secrets.CTT_TRACKING_ENDPOINT }}
           CTT_API_KEY: ${{ secrets.CTT_API_KEY }}
           CTT_TIMEOUT_SECONDS: "20"
 
           # Opcional / tuning
-          MAX_ORDERS: "250"
-          DAYS_BACK: "30"
-          SHOPIFY_REQS_PER_SECOND: "1.8"
-          SHOPIFY_MAX_RETRIES: "10"
-
+          MAX_SHOPIFY_ORDERS: "500"
           TZ_NAME: "Europe/Madrid"
         run: python update_shipping.py
