@@ -3,12 +3,13 @@ name: Actualizar estados Shopify CTT
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *" # cada 30 min (ajusta)
+    - cron: "*/30 * * * *" # cada 30 min
 
 jobs:
   update-shipping-status:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,14 +26,18 @@ jobs:
 
       - name: Run updater
         env:
-          # Shopify
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}                  # dondefue.myshopify.com (o sin dominio)
-          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}    # Admin API access token
+          # Shopify (compat con tu script)
+          SHOP_URL: ${{ secrets.SHOPIFY_SHOP_URL }}          # ej: https://dondefue.myshopify.com
           SHOPIFY_API_VERSION: "2024-04"
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+
+          # (Opcional) por si tu script también mira estas keys en algún punto
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}          # ej: dondefue.myshopify.com
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
 
           # CTT
-          CTT_TRACKING_ENDPOINT: ${{ secrets.CTT_TRACKING_ENDPOINT }} # p.ej. https://.../tracking?code={tracking}
-          CTT_API_KEY: ${{ secrets.CTT_API_KEY }}                     # si aplica (si no lo usas, déjalo vacío)
+          CTT_TRACKING_ENDPOINT: ${{ secrets.CTT_TRACKING_ENDPOINT }}
+          CTT_API_KEY: ${{ secrets.CTT_API_KEY }}
           CTT_TIMEOUT_SECONDS: "20"
 
           # Opcional / tuning
@@ -41,4 +46,5 @@ jobs:
           SHOPIFY_REQS_PER_SECOND: "1.8"
           SHOPIFY_MAX_RETRIES: "10"
 
+          TZ_NAME: "Europe/Madrid"
         run: python update_shipping.py
