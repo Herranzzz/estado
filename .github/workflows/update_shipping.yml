@@ -1,15 +1,14 @@
 name: Actualizar estados Shopify CTT
 
-permissions:
-  contents: read
-
 on:
-  schedule:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *" # cada 30 min (ajusta)
 
 jobs:
   update-shipping-status:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,37 +18,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Restaura la carpeta .state (SQLite + estado) de ejecuciones anteriores
-      - name: Restaurar estado (cache)
-        uses: actions/cache/restore@v4
-        with:
-          path: .state
-          key: state-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            state-${{ runner.os }}-
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
-
-      - name: Ejecutar script
+      - name: Run updater
         env:
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          SHOP_URL: "https://dondefue.myshopify.com"
-          SHOPIFY_API_VERSION: "2023-10"
-          TZ_NAME: "Europe/Madrid"
-          MAX_SHOPIFY_ORDERS: "250"   # <-- antes tenías ORDERS_LIMIT
-          STATE_DIR: ".state"
+          # Shopify
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}                  # dondefue.myshopify.com (o sin dominio)
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}    # Admin API access token
+          SHOPIFY_API_VERSION: "2024-04"
+
+          # CTT
+          CTT_TRACKING_ENDPOINT: ${{ secrets.CTT_TRACKING_ENDPOINT }} # p.ej. https://.../tracking?code={tracking}
+          CTT_API_KEY: ${{ secrets.CTT_API_KEY }}                     # si aplica (si no lo usas, déjalo vacío)
+          CTT_TIMEOUT_SECONDS: "20"
+
+          # Opcional / tuning
+          MAX_ORDERS: "250"
+          DAYS_BACK: "30"
+          SHOPIFY_REQS_PER_SECOND: "1.8"
+          SHOPIFY_MAX_RETRIES: "10"
+
         run: python update_shipping.py
-
-      # Evita el warning si el script falla antes de crear .state
-      - name: Asegurar carpeta de estado
-        if: always()
-        run: mkdir -p .state
-
-      # Guarda el estado al final (aunque falle el job)
-      - name: Guardar estado (cache)
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: state-${{ runner.os }}-${{ github.run_id }}
