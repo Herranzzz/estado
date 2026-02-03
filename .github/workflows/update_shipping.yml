@@ -1,61 +1,36 @@
 name: Actualizar estados Shopify CTT
 
+permissions:
+  contents: read
+
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *" # cada 30 min
+    - cron: "*/25 * * * *"
+  workflow_dispatch:
 
 jobs:
   update-shipping-status:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Clonar repositorio
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          lfs: false
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Configurar Python
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
 
-      # ✅ Construye SHOP_URL de forma segura (si tienes SHOPIFY_SHOP)
-      - name: Build SHOP_URL
-        shell: bash
+      - name: Ejecutar script
         env:
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}  # ej: dondefue.myshopify.com
-          SHOP_URL_SECRET: ${{ secrets.SHOP_URL }}   # (opcional) ej: https://dondefue.myshopify.com
-        run: |
-          set -euo pipefail
-          if [[ -n "${SHOP_URL_SECRET:-}" ]]; then
-            echo "SHOP_URL=${SHOP_URL_SECRET%/}" >> $GITHUB_ENV
-          elif [[ -n "${SHOPIFY_SHOP:-}" ]]; then
-            SHOP="${SHOPIFY_SHOP#https://}"
-            SHOP="${SHOP#http://}"
-            echo "SHOP_URL=https://${SHOP%/}" >> $GITHUB_ENV
-          else
-            echo "ERROR: Falta secrets.SHOPIFY_SHOP o secrets.SHOP_URL" >&2
-            exit 1
-          fi
-
-      - name: Run updater
-        env:
-          # Shopify (compat con tu script)
-          SHOP_URL: ${{ env.SHOP_URL }}
-          SHOPIFY_API_VERSION: "2024-04"
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-
-          # CTT (déjalos si tu script los usa; si no, puedes borrarlos)
-          CTT_TRACKING_ENDPOINT: ${{ secrets.CTT_TRACKING_ENDPOINT }}
-          CTT_API_KEY: ${{ secrets.CTT_API_KEY }}
-          CTT_TIMEOUT_SECONDS: "20"
-
-          # Opcional / tuning
-          MAX_SHOPIFY_ORDERS: "500"
-          TZ_NAME: "Europe/Madrid"
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }} # ej: dondefue.myshopify.com
+          ORDERS_LIMIT: "250"
+          LOCAL_TZ: "Europe/Madrid"
         run: python update_shipping.py
